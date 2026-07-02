@@ -1,0 +1,32 @@
+# Environment & secrets
+.env
+.env.local
+credentials/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Node
+node_modules/
+package-lock.json
+
+# Logs
+*.log
+logs/
+
+# Debug/test artifacts
+debug_bing.png
+debug_yelp.png
+
+# OS
+.DS_Store
+Thumbs.db
