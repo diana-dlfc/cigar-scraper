@@ -47,6 +47,12 @@ def _search(params: dict) -> dict:
         params=params,
         timeout=15,
     )
+
+    if resp.status_code != 200:
+        print("STATUS:", resp.status_code)
+        print("HEADERS:", resp.headers)
+        print("BODY:", resp.text)
+
     resp.raise_for_status()
     return resp.json()
 
