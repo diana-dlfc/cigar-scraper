@@ -1,30 +1,12 @@
 # enrichment/browser_enricher.py
-"""
-Enrichment asíncrono con Playwright + SearXNG/Brave.
-
-Flujo por lounge:
-  1. Buscar website en SearXNG → si falla, Brave Search
-  2. Visitar website con Playwright
-  3. Extraer: email, Instagram, Facebook, TikTok, YouTube, Google Maps
-  4. Guardar en Supabase solo los campos que estén vacíos
-
-Uso:
-    import asyncio
-    from enrichment.browser_enricher import enrich_batch_async
-    asyncio.run(enrich_batch_async(lounges, db))
-"""
 
 import os
 import re
 import asyncio
 import aiohttp
-import aiohttp.helpers
-from urllib.parse import quote as url_quote
+from urllib.parse import quote as url_quote, urlparse
 from loguru import logger
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
-
-# ── Configuración ────────────────────────────────────────────────────────────
 
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 
@@ -36,7 +18,7 @@ SEARXNG_INSTANCES = [
     "https://search.bus-hit.me",
 ]
 
-CONCURRENCY = 5  # navegadores simultáneos
+CONCURRENCY = 5
 
 SKIP_DOMAINS = {
     "yelp.com", "google.com", "facebook.com", "instagram.com", "tiktok.com",
@@ -52,15 +34,14 @@ SOCIAL_RE = {
     "instagram_url": re.compile(r"instagram\.com/([A-Za-z0-9_.]{2,30})(?:[/?]|$)", re.I),
     "facebook_url":  re.compile(r"facebook\.com/([A-Za-z0-9_.@\-]{2,60})(?:[/?]|$)", re.I),
     "tiktok_url":    re.compile(r"tiktok\.com/@([A-Za-z0-9_.]{2,30})(?:[/?]|$)", re.I),
-    "youtube_url":   re.compile(r"youtube\.com/(?:@|channel/|user/)?([A-Za-z0-9_\-]{2,60})(?:[/?]|$)", re.I),
 }
 
 GMAPS_RE = re.compile(r"(?:maps\.google\.com|goo\.gl/maps|google\.com/maps)[^\s\"'<>]+", re.I)
 
 SKIP_HANDLES = {
     "sharer", "share", "intent", "dialog", "login", "signup", "home",
-    "pages", "groups", "events", "watch", "shorts", "p", "reel", "stories",
-    "reels", "hashtag", "explore", "about",
+    "pages", "groups", "events", "p", "reel", "stories", "reels",
+    "hashtag", "explore", "about",
 }
 
 JUNK_EMAIL_DOMAINS = {
@@ -72,7 +53,6 @@ JUNK_EMAIL_DOMAINS = {
 # ── Búsqueda de website ──────────────────────────────────────────────────────
 
 async def _search_searxng(query: str, session: aiohttp.ClientSession) -> list[str]:
-    """Busca en SearXNG y retorna lista de URLs. Prueba instancias en orden."""
     for instance in SEARXNG_INSTANCES:
         try:
             async with session.get(
@@ -87,12 +67,10 @@ async def _search_searxng(query: str, session: aiohttp.ClientSession) -> list[st
                     return [u for u in urls if u]
         except Exception as e:
             logger.debug(f"SearXNG {instance} failed: {e}")
-            continue
     return []
 
 
 async def _search_brave(query: str, session: aiohttp.ClientSession) -> list[str]:
-    """Busca en Brave Search API (requiere BRAVE_API_KEY)."""
     if not BRAVE_API_KEY:
         return []
     try:
@@ -115,8 +93,6 @@ async def _search_brave(query: str, session: aiohttp.ClientSession) -> list[str]
 
 
 def _pick_website(urls: list[str], name: str) -> str | None:
-    """Elige el primer resultado que no sea un directorio conocido."""
-    name_words = set(name.lower().split())
     for url in urls:
         try:
             domain = urlparse(url).netloc.lower().replace("www.", "")
@@ -129,7 +105,6 @@ def _pick_website(urls: list[str], name: str) -> str | None:
 
 
 async def _search_bing_playwright(query: str, browser) -> list[str]:
-    """Busca en Bing usando Playwright con stealth (evita detección de bot)."""
     from playwright_stealth import Stealth
     page = await browser.new_page()
     await Stealth().apply_stealth_async(page)
@@ -137,8 +112,6 @@ async def _search_bing_playwright(query: str, browser) -> list[str]:
         url = f"https://www.bing.com/search?q={url_quote(query)}"
         await page.goto(url, timeout=20000, wait_until="domcontentloaded")
         await asyncio.sleep(2)
-
-        # Extraer URLs de resultados de búsqueda
         links = await page.eval_on_selector_all(
             "li.b_algo h2 a, .b_algo a[href]",
             "els => els.map(e => e.href)"
@@ -152,41 +125,34 @@ async def _search_bing_playwright(query: str, browser) -> list[str]:
 
 
 async def find_website(lounge: dict, session: aiohttp.ClientSession, browser=None) -> str | None:
-    """Busca el website oficial del lounge usando Bing (Playwright) → Brave API."""
     name  = lounge.get("name", "")
     city  = lounge.get("city", "")
     state = lounge.get("state", "")
     query = f'"{name}" cigar lounge {city} {state}'
-
     urls = []
     if browser:
         urls = await _search_bing_playwright(query, browser)
     if not urls:
         urls = await _search_brave(query, session)
-
     return _pick_website(urls, name)
 
 
 # ── Scraping de website ──────────────────────────────────────────────────────
 
 def _extract_from_html(html: str, base_url: str = "") -> dict:
-    """Extrae email, redes sociales y Google Maps de HTML."""
     soup = BeautifulSoup(html, "lxml")
     result = {
-        "email":         None,
-        "instagram_url": None,
-        "facebook_url":  None,
-        "tiktok_url":    None,
-        "youtube_url":   None,
+        "email":           None,
+        "instagram_url":   None,
+        "facebook_url":    None,
+        "tiktok_url":      None,
         "google_maps_url": None,
     }
 
-    # Recopilar todos los hrefs
     all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
     full_text = html
 
-    # ── Emails ──────────────────────────────────────────────────────────────
-    # Priorizar mailto:
+    # Emails — priorizar mailto:
     for href in all_hrefs:
         if href.startswith("mailto:"):
             email = href.replace("mailto:", "").split("?")[0].strip().lower()
@@ -195,16 +161,14 @@ def _extract_from_html(html: str, base_url: str = "") -> dict:
                 result["email"] = email
                 break
 
-    # Fallback: regex en HTML
     if not result["email"]:
-        emails = EMAIL_RE.findall(full_text)
-        for e in emails:
+        for e in EMAIL_RE.findall(full_text):
             domain = e.split("@")[-1].lower()
             if domain not in JUNK_EMAIL_DOMAINS and "." in domain:
                 result["email"] = e.lower()
                 break
 
-    # ── Redes sociales ───────────────────────────────────────────────────────
+    # Redes sociales — buscar en hrefs primero
     for href in all_hrefs:
         for field, pattern in SOCIAL_RE.items():
             if result[field]:
@@ -219,10 +183,8 @@ def _extract_from_html(html: str, base_url: str = "") -> dict:
                         result[field] = f"https://facebook.com/{handle}"
                     elif "tiktok" in field:
                         result[field] = f"https://tiktok.com/@{handle}"
-                    elif "youtube" in field:
-                        result[field] = f"https://youtube.com/@{handle}"
 
-    # Fallback: regex en texto completo para sociales no encontrados en hrefs
+    # Fallback: regex en texto completo
     for field, pattern in SOCIAL_RE.items():
         if result[field]:
             continue
@@ -236,10 +198,8 @@ def _extract_from_html(html: str, base_url: str = "") -> dict:
                     result[field] = f"https://facebook.com/{handle}"
                 elif "tiktok" in field:
                     result[field] = f"https://tiktok.com/@{handle}"
-                elif "youtube" in field:
-                    result[field] = f"https://youtube.com/@{handle}"
 
-    # ── Google Maps ──────────────────────────────────────────────────────────
+    # Google Maps
     for href in all_hrefs:
         if GMAPS_RE.search(href):
             result["google_maps_url"] = href
@@ -253,12 +213,11 @@ def _extract_from_html(html: str, base_url: str = "") -> dict:
 
 
 async def scrape_website(url: str, page) -> dict:
-    """Visita el website con Playwright (stealth) y extrae datos."""
     from playwright_stealth import Stealth
     await Stealth().apply_stealth_async(page)
     try:
         await page.goto(url, timeout=20000, wait_until="domcontentloaded")
-        await asyncio.sleep(1)  # esperar JS básico
+        await asyncio.sleep(1)
         html = await page.content()
         return _extract_from_html(html, base_url=url)
     except Exception as e:
@@ -269,14 +228,11 @@ async def scrape_website(url: str, page) -> dict:
 # ── Pipeline principal ───────────────────────────────────────────────────────
 
 async def enrich_one_async(lounge: dict, db, session: aiohttp.ClientSession, browser) -> dict:
-    """Enriquece un solo lounge. Retorna dict con campos encontrados."""
     lounge_id = lounge["id"]
     name = lounge.get("name", "?")
     result = {"id": lounge_id, "found": []}
-
     update = {}
 
-    # ── Paso 1: encontrar website ────────────────────────────────────────────
     website = lounge.get("website")
     if not website:
         website = await find_website(lounge, session, browser=browser)
@@ -284,7 +240,6 @@ async def enrich_one_async(lounge: dict, db, session: aiohttp.ClientSession, bro
             update["website"] = website
             logger.debug(f"[{name}] website → {website}")
 
-    # ── Paso 2: scraping del website ─────────────────────────────────────────
     if website:
         page = await browser.new_page()
         try:
@@ -295,7 +250,6 @@ async def enrich_one_async(lounge: dict, db, session: aiohttp.ClientSession, bro
         finally:
             await page.close()
 
-    # ── Paso 3: guardar en Supabase ──────────────────────────────────────────
     update["enriched"] = True
     try:
         db.client.table("cigar_lounges").update(update).eq("id", lounge_id).execute()
@@ -307,11 +261,8 @@ async def enrich_one_async(lounge: dict, db, session: aiohttp.ClientSession, bro
 
 
 async def enrich_batch_async(lounges: list[dict], db, concurrency: int = CONCURRENCY):
-    """
-    Enriquece una lista de lounges de forma asíncrona.
-    Usa un pool de browsers Playwright y sesiones aiohttp compartidas.
-    """
     from playwright.async_api import async_playwright
+    from playwright_stealth import Stealth
 
     total        = len(lounges)
     done         = 0
@@ -320,8 +271,6 @@ async def enrich_batch_async(lounges: list[dict], db, concurrency: int = CONCURR
     with_email   = 0
 
     semaphore = asyncio.Semaphore(concurrency)
-
-    from playwright_stealth import Stealth
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -337,16 +286,16 @@ async def enrich_batch_async(lounges: list[dict], db, concurrency: int = CONCURR
                     result = await enrich_one_async(lounge, db, session, browser)
                     done += 1
                     found = result.get("found", [])
-                    if "website"       in found: with_website += 1
-                    if "email"         in found: with_email   += 1
-                    if any(s in found for s in ("instagram_url", "facebook_url", "tiktok_url", "youtube_url")):
+                    if "website"      in found: with_website += 1
+                    if "email"        in found: with_email   += 1
+                    if any(s in found for s in ("instagram_url", "facebook_url", "tiktok_url")):
                         with_social += 1
                     if done % 10 == 0 or done == total:
                         print(f"  [{done}/{total}] web:{with_website} social:{with_social} email:{with_email}")
                     return result
 
             tasks = [process(l) for l in lounges]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         await browser.close()
 
