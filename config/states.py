@@ -55,15 +55,6 @@ US_STATES = {
     "DC": {"name": "Washington DC", "bbox": (38.79, -77.12, 38.99, -76.91)},
 }
 
-# States sorted by cigar market size (priority order for scraping)
-PRIORITY_STATES = [
-    "FL", "TX", "NY", "CA", "IL", "PA", "GA", "NC", "OH", "NJ",
-    "VA", "TN", "AZ", "MD", "CO", "MO", "NV", "SC", "IN", "LA",
-    "MA", "MN", "WI", "CT", "AL", "KY", "OR", "OK", "UT", "DC",
-    "AR", "MS", "KS", "NM", "NE", "WV", "ID", "HI", "NH", "ME",
-    "RI", "MT", "DE", "SD", "ND", "AK", "WY", "VT", "IA", "MI",
-    "WA", "WY",
-]
 
 def get_state_name(abbr: str) -> str:
     return US_STATES.get(abbr.upper(), {}).get("name", abbr)

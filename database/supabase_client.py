@@ -3,13 +3,9 @@ from supabase import create_client, Client
 from config.settings import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 
 
-def get_client() -> Client:
-    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-
-
 class SupabaseClient:
     def __init__(self):
-        self.client: Client = get_client()
+        self.client: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
     # --------------------------------------------------
     # CIGAR LOUNGES
@@ -41,15 +37,6 @@ class SupabaseClient:
         if state:
             query = query.eq("state", state)
         return query.limit(limit).execute().data or []
-
-    def mark_enriched(self, lounge_id: str) -> dict:
-        res = (
-            self.client.table("cigar_lounges")
-            .update({"enriched": True})
-            .eq("id", lounge_id)
-            .execute()
-        )
-        return res.data[0] if res.data else {}
 
     # --------------------------------------------------
     # CIGAR LOUNGES SOURCES

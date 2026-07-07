@@ -24,10 +24,6 @@ class JobStatusResponse(BaseModel):
     created_at: Optional[str] = None
 
 
-class ErrorResponse(BaseModel):
-    detail: str
-
-
 # ── Lounges ────────────────────────────────────────────────────────────────────
 
 class LoungeResponse(BaseModel):
@@ -67,15 +63,6 @@ class StatsResponse(BaseModel):
     enriched: int
     not_enriched: int
     by_state: dict[str, int]
-
-
-# ── Scrape ─────────────────────────────────────────────────────────────────────
-
-class ScrapeResultResponse(BaseModel):
-    found: int
-    saved: int
-    skipped: int
-    lounges: list[dict[str, Any]]
 
 
 # ── Enrich ─────────────────────────────────────────────────────────────────────

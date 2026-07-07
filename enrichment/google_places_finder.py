@@ -19,7 +19,7 @@ DETAILS_URL = "https://places.googleapis.com/v1/places/{place_id}"
 
 
 def find_place_id(name: str, city: str, state: str) -> str | None:
-    print(f">>> BUSCANDO: {name} | {city} | {state}")
+    logger.debug(f"Places: buscando {name} | {city} | {state}")
     if not PLACES_KEY:
         logger.warning("GOOGLE_PLACES_API_KEY no configurada")
         return None
@@ -37,8 +37,7 @@ def find_place_id(name: str, city: str, state: str) -> str | None:
     try:
         resp = requests.post(SEARCH_URL, json=body, headers=headers, timeout=10)
 
-        print("STATUS:", resp.status_code)
-        print(resp.text)
+        logger.debug(f"Places: status {resp.status_code} | {resp.text[:200]}")
         if resp.status_code == 200:
             places = resp.json().get("places", [])
             if places:
@@ -64,7 +63,7 @@ def get_place_details(place_id: str) -> dict:
         resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
-            print(data)
+            logger.debug(f"Places: details {data}")
             return {
                 "website":         data.get("websiteUri"),
                 "google_maps_url": data.get("googleMapsUri"),
@@ -77,7 +76,6 @@ def get_place_details(place_id: str) -> dict:
 
 
 def enrich_with_google_places(lounge: dict) -> dict:
-    print(">>> ENTRÉ A enrich_with_google_places")
     name  = lounge.get("name", "")
     city  = lounge.get("city", "")
     state = lounge.get("state", "")

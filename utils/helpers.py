@@ -1,6 +1,5 @@
 # utils/helpers.py
 import re
-import time
 import unicodedata
 from datetime import datetime, timezone
 
@@ -66,36 +65,3 @@ def safe_int(value) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-def rate_limit(delay: float = 1.0):
-    """Sleep for `delay` seconds — use between API calls."""
-    time.sleep(delay)
-
-
-def chunks(lst: list, n: int):
-    """Yield successive n-sized chunks from lst."""
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
-
-
-def extract_state_from_address(address: str) -> str | None:
-    """Try to extract a 2-letter US state abbreviation from a formatted address."""
-    if not address:
-        return None
-    # Match patterns like ", FL 33101" or ", Florida,"
-    match = re.search(r",\s*([A-Z]{2})\s+\d{5}", address)
-    if match:
-        return match.group(1)
-    return None
-
-
-def extract_city_from_address(address: str) -> str | None:
-    """Try to extract city from a Google-style formatted address."""
-    if not address:
-        return None
-    parts = [p.strip() for p in address.split(",")]
-    # Format: "Street, City, ST ZIP, USA"
-    if len(parts) >= 2:
-        return parts[-3] if len(parts) >= 3 else parts[0]
-    return None

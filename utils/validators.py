@@ -1,5 +1,4 @@
 # utils/validators.py
-import re
 import unicodedata
 from config.search_config import CIGAR_KEYWORDS, EXCLUDE_KEYWORDS
 
@@ -17,30 +16,6 @@ def is_cigar_venue(name, types=None, description=""):
         if kw in text:
             return True
     return False
-
-
-def validate_lounge_data(data):
-    errors = []
-    if not data.get("name"):
-        errors.append("Missing required field: name")
-    if not data.get("slug"):
-        errors.append("Missing required field: slug")
-    lat = data.get("latitude")
-    lon = data.get("longitude")
-    if lat is not None and not (-90 <= lat <= 90):
-        errors.append(f"Invalid latitude: {lat}")
-    if lon is not None and not (-180 <= lon <= 180):
-        errors.append(f"Invalid longitude: {lon}")
-    rating = data.get("rating")
-    if rating is not None and not (0 <= rating <= 5):
-        errors.append(f"Invalid rating: {rating}")
-    phone = data.get("phone")
-    if phone and not re.match(r"^\+?[\d\s\-().]{7,20}$", phone):
-        errors.append(f"Suspicious phone format: {phone}")
-    website = data.get("website")
-    if website and not website.startswith(("http://", "https://")):
-        errors.append(f"Invalid website URL: {website}")
-    return len(errors) == 0, errors
 
 
 def sanitize_lounge_data(data):
