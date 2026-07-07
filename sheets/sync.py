@@ -94,11 +94,7 @@ LINK_KEYS = {
     "google_maps_url": "Ver en Maps",
     "instagram_url":   "Instagram",
     "facebook_url":    "Facebook",
-    "twitter_url":     "Twitter",
     "tiktok_url":      "TikTok",
-    "youtube_url":     "YouTube",
-    "linkedin_url":    "LinkedIn",
-    "yelp_url":        "Yelp",
     "website":         "Sitio Web",
 }
 

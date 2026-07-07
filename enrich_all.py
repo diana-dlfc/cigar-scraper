@@ -102,7 +102,6 @@ async def scrape_all_websites(lounges: list[dict]) -> dict:
                         "instagram_url": scraped.get("instagram_url"),
                         "facebook_url":  scraped.get("facebook_url"),
                         "tiktok_url":    scraped.get("tiktok_url"),
-                        "youtube_url":   scraped.get("youtube_url"),
                     }.items()
                     if v and not lounge.get(k)  # no sobreescribir si ya existe
                 }
@@ -117,7 +116,7 @@ async def scrape_all_websites(lounges: list[dict]) -> dict:
                 found = [k for k, v in update.items() if v and k != "enriched"]
                 done += 1
                 if "email"         in found: with_email  += 1
-                if any(s in found for s in ("instagram_url","facebook_url","tiktok_url","youtube_url")):
+                if any(s in found for s in ("instagram_url", "facebook_url", "tiktok_url")):
                     with_social += 1
 
                 if done % 10 == 0 or done == total:

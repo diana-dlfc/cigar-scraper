@@ -30,7 +30,7 @@ def enrich_lounge(lounge: dict, db=None) -> dict:
     Returns:
         Merged enrichment dict with keys:
         email, emails_all, email_source,
-        instagram, facebook, twitter, youtube, tiktok, yelp_url, linkedin,
+        instagram_url, facebook_url, tiktok_url,
         owner_name, owner_source, enriched, last_enriched_at
     """
     name = lounge.get("name", "unknown")
@@ -41,7 +41,6 @@ def enrich_lounge(lounge: dict, db=None) -> dict:
     social_data = find_socials(lounge)
     owner_data  = find_owner(lounge)
 
-    # Map social keys to DB column names
     enrichment = {
         # Email
         "email":        email_data.get("email"),
@@ -49,13 +48,9 @@ def enrich_lounge(lounge: dict, db=None) -> dict:
         "email_source": email_data.get("email_source"),
 
         # Social
-        "instagram": social_data.get("instagram"),
-        "facebook":  social_data.get("facebook"),
-        "twitter":   social_data.get("twitter"),
-        "youtube":   social_data.get("youtube"),
-        "tiktok":    social_data.get("tiktok"),
-        "yelp_url":  social_data.get("yelp"),
-        "linkedin":  social_data.get("linkedin"),
+        "instagram_url": social_data.get("instagram"),
+        "facebook_url":  social_data.get("facebook"),
+        "tiktok_url":    social_data.get("tiktok"),
 
         # Owner
         "owner_name":   owner_data.get("owner_name"),
@@ -75,7 +70,6 @@ def enrich_lounge(lounge: dict, db=None) -> dict:
 
 def _save_enrichment(db, lounge_id: str, data: dict):
     """Persist enrichment fields to cigar_lounges table."""
-    # Only send fields that Supabase schema has (exclude runtime-only fields)
     db_fields = {
         k: v for k, v in data.items()
         if k not in ("emails_all", "email_source", "owner_source")
@@ -124,8 +118,7 @@ def enrich_batch(
         result = enrich_lounge(lounge, db=db)
         results.append(result)
 
-        # Summary log
-        found = [k for k in ("email", "instagram", "facebook", "owner_name") if result.get(k)]
+        found = [k for k in ("email", "instagram_url", "facebook_url", "tiktok_url", "owner_name") if result.get(k)]
         logger.info(f"  → Found: {found if found else 'nothing'}")
 
         if i < total - 1:
