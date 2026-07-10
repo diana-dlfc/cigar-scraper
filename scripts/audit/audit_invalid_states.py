@@ -2,7 +2,11 @@
 # Auditoría de registros con state inválido (fuera de los 50 estados + DC).
 # NO elimina ningún registro.
 #
-# Run: venv\Scripts\python audit_invalid_states.py
+# Run: venv\Scripts\python scripts\audit\audit_invalid_states.py
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from collections import defaultdict
 from dotenv import load_dotenv

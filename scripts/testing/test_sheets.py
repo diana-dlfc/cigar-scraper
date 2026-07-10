@@ -1,4 +1,11 @@
 # test_sheets.py — exporta datos reales de Supabase a Google Sheets
+#
+# Run: venv\Scripts\python scripts\testing\test_sheets.py
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
 from dotenv import load_dotenv
 load_dotenv()
 

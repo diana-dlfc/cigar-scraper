@@ -3,13 +3,15 @@
 # Muestra estadísticas por página y guarda el HTML cuando no encuentra redes.
 #
 # Run:
-#   venv\Scripts\python debug_crawler.py https://padron.com
-#   venv\Scripts\python debug_crawler.py padron.com        (agrega https:// solo)
+#   venv\Scripts\python scripts\testing\debug_crawler.py https://padron.com
+#   venv\Scripts\python scripts\testing\debug_crawler.py padron.com        (agrega https:// solo)
 
 import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
 import asyncio
 import re
-from pathlib import Path
 from urllib.parse import urlparse, urljoin
 from datetime import datetime
 from dotenv import load_dotenv
@@ -34,7 +36,8 @@ from enrichment.browser_enricher import (
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DEFAULT_URL = "https://padron.com"
-OUTPUT_DIR  = Path("debug_html")
+# HTML de debug se guarda en la raíz del proyecto, no en la carpeta del script
+OUTPUT_DIR  = Path(__file__).resolve().parent.parent.parent / "debug_html"
 
 SOCIAL_DOMAINS = {
     "facebook.com": "Facebook",

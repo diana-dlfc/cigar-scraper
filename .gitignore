@@ -26,6 +26,19 @@ logs/
 # Debug/test artifacts
 debug_bing.png
 debug_yelp.png
+debug_html/
+debug_*.html
+debug_*.png
+debug_*.json
+
+# Generated reports
+enrichment_report_*.csv
+scrape_report_*.csv
+
+# Temporary files
+*.tmp
+*.bak
+*.old
 
 # OS
 .DS_Store

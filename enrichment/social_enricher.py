@@ -4,17 +4,19 @@
 #
 # Prioridades:
 #   1. Scrape del website oficial (si existe)
-#   2. UNA búsqueda en Google → Knowledge Panel + resultados orgánicos
-#   3. Visitar el website nuevo encontrado en Google
+#   2. Búsqueda por motor para cada red social faltante:
+#      Bing → DuckDuckGo → Brave Search
+#      Consulta: "Business Name" City State site:platform.com
 #
 # Nunca sobreescribe campos existentes. Valida antes de guardar.
 # Modo debug: establecer DEBUG = True desde enrich_social.py --debug
 
 import asyncio
+import base64
 import random
 import re
 import time
-from urllib.parse import urlparse, parse_qs, quote as url_quote
+from urllib.parse import urlparse, parse_qs
 from loguru import logger
 from bs4 import BeautifulSoup
 
@@ -39,18 +41,94 @@ SKIP_HANDLES = {
     "hashtag", "explore", "about", "watch", "shorts", "create",
 }
 
+# Primer segmento del path que indica una ruta funcional, no un perfil.
+# Se compara contra el segmento RAW (antes de normalizar) para capturar
+# tanto "sharer" como "sharer.php", "embed" como "embed.js", etc.
+BLOCKED_SOCIAL_PATHS = frozenset({
+    # Ayuda y legales
+    "docs", "help", "settings", "privacy", "terms", "policy",
+    "recover", "login", "signup",
+    # Funciones de plataforma
+    "dialog", "plugins", "share", "sharer.php", "profile.php",
+    "accounts", "business", "developer", "developers",
+    # Contenido (no perfiles)
+    "about", "watch", "marketplace", "gaming", "reels", "stories",
+    "groups", "events", "blog", "embed", "embed.js", "explore",
+    "tr",
+})
+
+# Rutas adicionales bloqueadas por plataforma (complementan BLOCKED_SOCIAL_PATHS).
+# Usar estas listas para paths que solo aplican a una red especifica.
+BLOCKED_FACEBOOK_PATHS = frozenset({
+    # Todos los paths de Facebook actualmente bloqueados ya estan en
+    # BLOCKED_SOCIAL_PATHS. Agregar aqui exclusivos de Facebook si aparecen.
+})
+
+BLOCKED_INSTAGRAM_PATHS = frozenset({
+    "reel",   # post individual (/reel/<id>) — distinto de "reels" (seccion)
+    "p",      # post individual (/p/<shortcode>)
+    "legal",  # pagina legal de la plataforma
+})
+
+# Mapa host -> set de paths extra bloqueados para esa plataforma.
+# Se consulta dentro de _validate_social() despues de BLOCKED_SOCIAL_PATHS.
+_PLATFORM_PATH_EXTRAS: dict = {
+    "facebook.com": BLOCKED_FACEBOOK_PATHS,
+    "fb.com":       BLOCKED_FACEBOOK_PATHS,
+    "instagram.com": BLOCKED_INSTAGRAM_PATHS,
+}
+
+# Usernames de plataformas de construccion web y servicios conocidos que
+# aparecen como falsos positivos en redes sociales.
+# Se compara despues de extraer y normalizar el handle (solo minusculas).
+BLOCKED_SOCIAL_USERNAMES = frozenset({
+    "wix",
+    "wordpress",
+    "wordpresscom",
+    "shopify",
+    "elementor",
+    "webflow",
+    "weebly",
+    "godaddy",
+    "helium",
+    "squarespace",
+    "wixpress",
+    "jimdo",
+    "bigcommerce",
+    "magento",
+})
+
+# Formato valido de handle social: empieza con alfanumerico,
+# luego letras/digitos/punto/guion/guion_bajo, max 60 chars.
+_HANDLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@\-]{0,59}$")
+
+# Extensiones de archivo que aparecen como TLD en falsos positivos del EMAIL_RE
+# (ej: "user@image.png", "style@theme.css" captados en texto de recursos)
+_JUNK_EMAIL_TLDS = frozenset({
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "tiff",
+    "css", "scss", "less",
+    "js", "ts", "jsx", "tsx", "mjs", "cjs", "min",
+    "map", "json", "xml", "yaml", "yml",
+    "woff", "woff2", "ttf", "eot", "otf",
+    "pdf", "zip", "gz", "tar",
+})
+
+# Partes locales siempre basura (independiente del dominio)
+_JUNK_EMAIL_LOCALS = frozenset({
+    "example", "user", "test", "noreply", "no-reply",
+    "donotreply", "do-not-reply",
+})
+
+# Dominios basura adicionales (se unen a JUNK_EMAIL_DOMAINS en la validacion)
+_JUNK_EMAIL_DOMAINS_EXTRA = frozenset({
+    "heliumdev.com", "company.site",
+    "sentry-next.wixpress.com",
+})
+
 JUNK_EMAIL_DOMAINS = {
     "example.com", "sentry.io", "wixpress.com", "squarespace.com",
     "wordpress.com", "godaddy.com", "cloudflare.com", "w3.org",
     "schema.org", "google.com", "gmail.com", "yahoo.com",
-}
-
-SKIP_WEBSITE_DOMAINS = {
-    "yelp.com", "google.com", "facebook.com", "instagram.com", "tiktok.com",
-    "twitter.com", "x.com", "youtube.com", "tripadvisor.com", "yellowpages.com",
-    "mapquest.com", "foursquare.com", "apple.com", "linkedin.com", "bing.com",
-    "wikipedia.org", "duckduckgo.com", "bbb.org", "thumbtack.com",
-    "nextdoor.com", "groupon.com", "opentable.com", "maps.google.com",
 }
 
 STOP_WORDS = {
@@ -59,8 +137,36 @@ STOP_WORDS = {
     "cigars", "smoking",
 }
 
+
+# Dominio objetivo por campo social
+_PLATFORM_SITE = {
+    "facebook_url":  "facebook.com",
+    "instagram_url": "instagram.com",
+    "tiktok_url":    "tiktok.com",
+}
+
+# Etiqueta en lenguaje natural para cada campo — usada en la query de Google
+_PLATFORM_QUERY_LABEL = {
+    "facebook_url":  "Facebook",
+    "instagram_url": "Instagram",
+    "tiktok_url":    "TikTok",
+    "email":         "email",
+}
+
 # Stats globales (se resetean en enrich_batch_async)
 _stats: dict = {}
+
+# Contador atómico de llamadas a _search_google por (lounge_id, field).
+# Keyed por (lounge.get("id"), field) — asyncio es single-threaded, no hay race.
+_search_call_counts: dict[tuple, int] = {}
+
+# ── Cachés en memoria (solo duran lo que dura el proceso) ─────────────────────
+# search_cache : query exacta  → resultado de _search_google()
+# website_cache: URL website   → resultado de _scrape_website()
+# maps_cache   : URL maps      → resultado de _enrich_from_maps()
+_search_cache:  dict[str, str | None] = {}
+_website_cache: dict[str, dict]       = {}
+_maps_cache:    dict[str, dict]       = {}
 
 
 # ── Debug helper ──────────────────────────────────────────────────────────────
@@ -75,17 +181,27 @@ def _dbg(msg: str):
 def _reset_stats():
     _stats.clear()
     _stats.update({
-        "processed":        0,
-        "website_found":    0,
-        "website_reused":   0,
-        "email_found":      0,
-        "facebook_found":   0,
-        "instagram_found":  0,
-        "tiktok_found":     0,
-        "google_searches":  0,
-        "discarded":        0,
-        "start_time":       time.time(),
+        "processed":         0,
+        "website_reused":    0,
+        # campos encontrados durante esta ejecución
+        "email_found":       0,
+        "facebook_found":    0,
+        "instagram_found":   0,
+        "tiktok_found":      0,
+        # campos que estaban vacíos al inicio (se pueblan en enrich_batch_async)
+        "email_missing":     0,
+        "facebook_missing":  0,
+        "instagram_missing": 0,
+        "tiktok_missing":    0,
+        "engine_searches":   0,
+        "maps_queries":      0,
+        "discarded":         0,
+        "start_time":        time.time(),
     })
+    # Limpiar cachés al inicio de cada ejecución
+    _search_cache.clear()
+    _website_cache.clear()
+    _maps_cache.clear()
 
 
 def _missing_fields(lounge: dict) -> set[str]:
@@ -102,84 +218,236 @@ def _name_tokens(name: str) -> list[str]:
     return [w for w in words if w not in STOP_WORDS and len(w) > 2]
 
 
-def _unwrap_google_url(href: str) -> str:
-    if not href:
-        return href
-    if href.startswith("/url?") or ("google.com/url?" in href):
-        try:
-            params = parse_qs(urlparse(href).query)
-            if "q" in params:
-                return params["q"][0]
-        except Exception:
-            pass
-    return href
-
-
 # ── Validación ────────────────────────────────────────────────────────────────
 
 def _validate_social(url: str, lounge: dict, source: str = "organic") -> bool:
     """
-    Verifica que la URL social pertenezca a este negocio.
-    En modo DEBUG imprime el razonamiento completo.
+    Verifica que la URL social sea un perfil real y pertenezca a este negocio.
+
+    Orden de comprobaciones:
+      1. Normalizar y parsear la URL (quitar query, fragment, espacios)
+      2a. Rechazar rutas comunes no-perfil (BLOCKED_SOCIAL_PATHS)
+      2b. Rechazar rutas especificas de la plataforma (_PLATFORM_PATH_EXTRAS)
+      3. Quitar prefijos de plataforma (@, pages/, etc.) para aislar el handle
+      4. Validar formato del handle con _HANDLE_RE
+      5. Rechazar handles en SKIP_HANDLES o BLOCKED_SOCIAL_USERNAMES
+      6. Coincidencia de tokens del nombre del negocio contra el handle
     """
     name = lounge.get("name", "?")
 
-    # Knowledge Panel: Google ya verificó la correspondencia
-    if source == "knowledge_panel":
-        _dbg(f"    ✓ ACEPTADO [{source}] — Google KP es fuente de confianza: {url}")
-        return True
-
+    # 1. Normalizar y parsear
     try:
-        path = urlparse(url).path.lower().strip("/")
+        # Quitar espacios, asegurar esquema para que urlparse funcione bien
+        clean_url = url.strip()
+        if not clean_url.startswith(("http://", "https://")):
+            clean_url = "https://" + clean_url
+        parsed = urlparse(clean_url)
+        # Path limpio: sin query ni fragment, en minusculas
+        path = parsed.path.lower().strip("/")
     except Exception:
-        _dbg(f"    ✗ RECHAZADO — URL inválida: {url}")
+        _dbg(f"    x RECHAZADO -- URL invalida: {url}")
         _stats["discarded"] += 1
         return False
 
-    # Quitar prefijos comunes de plataforma
-    path = re.sub(r"^(@|pages/|company/|biz/|user/|channel/)", "", path)
-    handle = _normalize(path.split("/")[0])
-
-    if not handle or len(handle) < 2:
-        _dbg(f"    ✗ RECHAZADO — handle vacío o demasiado corto: '{handle}' ({url})")
+    # 2a. Rechazar rutas funcionales comunes (aplican a todas las plataformas)
+    #     Comprobamos el primer segmento raw para capturar "sharer.php", "embed.js", etc.
+    raw_first = path.split("/")[0] if path else ""
+    raw_first_no_ext = raw_first.split(".")[0]   # "sharer.php" -> "sharer"
+    if raw_first in BLOCKED_SOCIAL_PATHS or raw_first_no_ext in BLOCKED_SOCIAL_PATHS:
+        _dbg(f"    x RECHAZADO -- ruta funcional comun '{raw_first}': {url}")
         _stats["discarded"] += 1
         return False
 
+    # 2b. Rechazar rutas especificas de la plataforma
+    host = re.sub(r"^(www\.|m\.)", "", parsed.netloc.lower())
+    platform_paths = _PLATFORM_PATH_EXTRAS.get(host, frozenset())
+    if raw_first in platform_paths or raw_first_no_ext in platform_paths:
+        _dbg(f"    x RECHAZADO -- ruta funcional de {host} '{raw_first}': {url}")
+        _stats["discarded"] += 1
+        return False
+
+    # 3. Quitar prefijos de plataforma para aislar el handle
+    path = re.sub(r"^(@|pages/|people/|company/|biz/|user/|channel/)", "", path)
+    raw_handle = path.split("/")[0].lstrip("@")   # sin normalizar aun
+
+    # 4. Validar formato del handle (caracteres permitidos, longitud)
+    if not raw_handle or len(raw_handle) < 2:
+        _dbg(f"    x RECHAZADO -- handle vacio o demasiado corto: '{raw_handle}' ({url})")
+        _stats["discarded"] += 1
+        return False
+    if not _HANDLE_RE.match(raw_handle):
+        _dbg(f"    x RECHAZADO -- handle con caracteres invalidos: '{raw_handle}' ({url})")
+        _stats["discarded"] += 1
+        return False
+
+    # 5. Normalizar handle y comprobar listas negras
+    handle = _normalize(raw_handle)
     if handle in SKIP_HANDLES:
-        _dbg(f"    ✗ RECHAZADO — handle '{handle}' está en lista negra ({url})")
+        _dbg(f"    x RECHAZADO -- handle '{handle}' en SKIP_HANDLES ({url})")
+        _stats["discarded"] += 1
+        return False
+    if handle in BLOCKED_SOCIAL_USERNAMES:
+        _dbg(f"    x RECHAZADO -- handle '{handle}' en BLOCKED_SOCIAL_USERNAMES ({url})")
         _stats["discarded"] += 1
         return False
 
+    # 6. Coincidencia de tokens del nombre del negocio
     tokens = _name_tokens(name)
 
     _dbg(f"    ? Validando [{source}]: {url}")
-    _dbg(f"      handle='{handle}'")
-    _dbg(f"      tokens del nombre='{name}': {tokens}")
+    _dbg(f"      handle='{handle}' (raw: '{raw_handle}')")
+    _dbg(f"      tokens del nombre '{name}': {tokens}")
 
     if not tokens:
-        _dbg(f"      ✓ ACEPTADO — sin tokens significativos, no se puede validar")
+        _dbg(f"      + ACEPTADO -- sin tokens significativos, no se puede refutar")
         return True
 
-    # Comprobar token a token
     for token in tokens:
         norm_token = _normalize(token)
         if norm_token in handle:
-            _dbg(f"      ✓ ACEPTADO — token '{token}' → '{norm_token}' encontrado en handle '{handle}'")
+            _dbg(f"      + ACEPTADO -- token '{token}' -> '{norm_token}' en handle '{handle}'")
             return True
 
-    # Comprobar si el handle está contenido en el nombre
     name_norm = _normalize(name)
     if handle in name_norm:
-        _dbg(f"      ✓ ACEPTADO — handle '{handle}' está dentro del nombre normalizado '{name_norm}'")
+        _dbg(f"      + ACEPTADO -- handle '{handle}' dentro del nombre '{name_norm}'")
         return True
 
-    _dbg(f"      ✗ RECHAZADO — ningún token {tokens} coincide con handle '{handle}'")
+    _dbg(f"      x RECHAZADO -- ningun token {tokens} coincide con handle '{handle}'")
     _dbg(f"        nombre normalizado='{name_norm}'")
     _stats["discarded"] += 1
     return False
 
 
-# ── Extracción de HTML ────────────────────────────────────────────────────────
+# ── Validación de email ───────────────────────────────────────────────────────
+
+def _validate_email(email: str) -> bool:
+    """
+    Filtro de ultimo nivel para emails antes de guardarlos en DB.
+    Complementa JUNK_EMAIL_DOMAINS (que ya se aplica durante la extraccion).
+
+    Rechaza:
+      - TLD que son extensiones de archivo (.png, .js, .css, etc.)
+      - Dominios basura conocidos (_JUNK_EMAIL_DOMAINS_EXTRA y subdominios)
+      - Partes locales siempre basura (noreply, test, example, user, ...)
+      - admin@<dominio con "example">
+      - Emails sin punto en el dominio o con TLD de 1 caracter
+    """
+    if not email or "@" not in email:
+        return False
+
+    local, _, domain = email.lower().partition("@")
+    tld = domain.rsplit(".", 1)[-1] if "." in domain else ""
+
+    # TLD es una extension de archivo — falso positivo del regex
+    if tld in _JUNK_EMAIL_TLDS:
+        _dbg(f"  [email] rechazado — TLD de archivo: '{tld}' en '{email}'")
+        return False
+
+    # Dominio basura (lista ampliada + subdominos)
+    all_junk_domains = JUNK_EMAIL_DOMAINS | _JUNK_EMAIL_DOMAINS_EXTRA
+    if domain in all_junk_domains:
+        _dbg(f"  [email] rechazado — dominio basura: '{domain}'")
+        return False
+    if any(domain.endswith("." + d) for d in all_junk_domains):
+        _dbg(f"  [email] rechazado — subdominio basura: '{domain}'")
+        return False
+
+    # Parte local siempre basura
+    if local in _JUNK_EMAIL_LOCALS:
+        _dbg(f"  [email] rechazado — local basura: '{local}'")
+        return False
+
+    # admin@<dominio de ejemplo>
+    if local == "admin" and "example" in domain:
+        _dbg(f"  [email] rechazado — admin@example: '{email}'")
+        return False
+
+    # Debe tener punto en el dominio y TLD de al menos 2 caracteres
+    if "." not in domain or len(tld) < 2:
+        _dbg(f"  [email] rechazado — dominio mal formado: '{domain}'")
+        return False
+
+    return True
+
+
+# ── Normalización de website ──────────────────────────────────────────────────
+
+# Hosts que indican que el campo `website` es en realidad una red social.
+# Se compara contra el host sin "www." ni "m.".
+_SOCIAL_HOSTS: dict[str, str] = {
+    "facebook.com":   "facebook_url",
+    "fb.com":         "facebook_url",
+    "instagram.com":  "instagram_url",
+    "tiktok.com":     "tiktok_url",
+    "vm.tiktok.com":  "tiktok_url",
+}
+
+
+def _social_field_for_url(url: str) -> str | None:
+    """
+    Devuelve el nombre del campo social si la URL pertenece a una red social,
+    o None si parece ser un sitio web real del negocio.
+    """
+    if not url:
+        return None
+    try:
+        raw = url if "://" in url else "https://" + url
+        host = urlparse(raw).netloc.lower()
+        host = re.sub(r"^(www\.|m\.)", "", host)
+    except Exception:
+        return None
+    return _SOCIAL_HOSTS.get(host)
+
+
+async def _normalize_website(lounge: dict, db) -> dict:
+    """
+    Si `website` es una URL de red social, la reclasifica al campo correcto:
+      - Mueve el valor a facebook_url / instagram_url / tiktok_url
+        (solo si ese campo estaba vacío; no sobreescribe)
+      - Limpia el campo `website`
+      - Persiste el cambio en Supabase de inmediato
+
+    Debe llamarse al inicio de enrich_one(), antes de calcular missing_fields.
+    """
+    website = lounge.get("website")
+    if not website:
+        return lounge
+
+    field = _social_field_for_url(website)
+    if field is None:
+        return lounge  # es un sitio web real, no tocar
+
+    name = lounge.get("name", "?")
+    lounge = dict(lounge)  # copia para no mutar el original
+
+    if lounge.get(field):
+        # El campo social ya tiene un valor — solo limpiamos website
+        logger.info(
+            f"[NORM] {name!r}: website={website!r} es {field} "
+            f"pero ya tiene valor — solo limpiando website"
+        )
+        db_update = {"website": None}
+    else:
+        # Mover website → campo social
+        logger.info(f"[NORM] {name!r}: reclasificando website → {field} = {website!r}")
+        lounge[field] = website
+        db_update = {"website": None, field: website}
+        if DEBUG:
+            print(f"  [NORM] website reclasificado → {field}: {website}")
+
+    lounge["website"] = None
+
+    if lounge.get("id"):
+        try:
+            db.client.table("cigar_lounges").update(db_update).eq("id", lounge["id"]).execute()
+        except Exception as exc:
+            logger.warning(f"[NORM] {name!r}: error actualizando DB: {exc}")
+
+    return lounge
+
+
+# ── Extracción ────────────────────────────────────────────────────────────────
 
 def _build_social_url(field: str, handle: str) -> str | None:
     if "instagram" in field:
@@ -191,252 +459,31 @@ def _build_social_url(field: str, handle: str) -> str | None:
     return None
 
 
-def _extract_from_html(html: str, missing: set[str], lounge: dict = None,
-                       source: str = "website") -> dict:
-    soup = BeautifulSoup(html, "lxml")
-    result = {}
-    all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
-    full_text = html
-
-    # Email — priorizar mailto:
-    if "email" in missing:
-        for href in all_hrefs:
-            if href.startswith("mailto:"):
-                email = href.replace("mailto:", "").split("?")[0].strip().lower()
-                domain = email.split("@")[-1] if "@" in email else ""
-                if domain and domain not in JUNK_EMAIL_DOMAINS:
-                    result["email"] = email
-                    break
-        if "email" not in result:
-            for e in EMAIL_RE.findall(full_text):
-                domain = e.split("@")[-1].lower()
-                if domain not in JUNK_EMAIL_DOMAINS and "." in domain:
-                    result["email"] = e.lower()
-                    break
-
-    # Redes sociales — buscar en hrefs primero
-    for href in all_hrefs:
-        real_href = _unwrap_google_url(href)
-        for field, pattern in SOCIAL_RE.items():
-            if field not in missing or field in result:
-                continue
-            match = pattern.search(real_href)
-            if match:
-                handle = match.group(1).strip("/")
-                if handle.lower() in SKIP_HANDLES or len(handle) <= 1:
-                    _dbg(f"    ✗ {field}: handle '{handle}' en lista negra — {real_href[:80]}")
-                    continue
-                url = _build_social_url(field, handle)
-                if url and _validate_social(url, lounge or {}, source):
-                    result[field] = url
-
-    # Fallback: regex en texto completo
-    for field, pattern in SOCIAL_RE.items():
-        if field not in missing or field in result:
-            continue
-        match = pattern.search(full_text)
-        if match:
-            handle = match.group(1).strip("/")
-            if handle.lower() in SKIP_HANDLES or len(handle) <= 1:
-                continue
-            url = _build_social_url(field, handle)
-            if url and _validate_social(url, lounge or {}, source):
-                result[field] = url
-
-    return result
-
-
-# ── Debug: resultados orgánicos de Google ─────────────────────────────────────
-
-def _debug_google_organic(soup: BeautifulSoup, html: str):
-    """
-    Imprime los primeros 10 resultados orgánicos de Google tal como los lee
-    Playwright: título, URL mostrada y snippet. Sin filtrar nada.
-    """
-    print("\n  ┌─ RESULTADOS ORGÁNICOS (raw) ─────────────────────────────")
-
-    results_found = []
-
-    # Estrategia 1: contenedores div.g (clásico)
-    containers = soup.select("div.g")
-
-    # Estrategia 2: si div.g no aparece, buscar por h3 + contexto
-    if not containers:
-        containers = [h3.find_parent("div") for h3 in soup.find_all("h3") if h3.find_parent("div")]
-
-    for container in containers[:10]:
-        title_tag   = container.find("h3")
-        title       = title_tag.get_text(strip=True) if title_tag else "(sin título)"
-
-        # URL: buscar en <cite> primero, luego en primer <a href>
-        cite_tag = container.find("cite")
-        url_disp = cite_tag.get_text(strip=True) if cite_tag else ""
-        if not url_disp:
-            a_tag    = container.find("a", href=True)
-            url_disp = _unwrap_google_url(a_tag["href"]) if a_tag else "(sin URL)"
-
-        # Snippet: div con clase conocida o primer texto largo
-        snippet = ""
-        for sel in ("div.VwiC3b", "span.st", "div[data-sncf]", "div.s"):
-            s = container.select_one(sel)
-            if s:
-                snippet = s.get_text(strip=True)[:160]
-                break
-        if not snippet:
-            texts = [t.strip() for t in container.stripped_strings if len(t.strip()) > 40]
-            snippet = texts[0][:160] if texts else "(sin snippet)"
-
-        results_found.append((title, url_disp, snippet))
-
-    if not results_found:
-        # Último recurso: imprimir todos los <h3> de la página
-        h3_list = soup.find_all("h3")
-        print(f"  │  div.g no encontrado. H3 en la página ({len(h3_list)}):")
-        for h3 in h3_list[:10]:
-            print(f"  │    • {h3.get_text(strip=True)}")
-
-        # Y todos los links externos
-        ext_links = [
-            _unwrap_google_url(a["href"])
-            for a in soup.find_all("a", href=True)
-            if a.get("href", "").startswith("http") and "google" not in a.get("href","")
-        ]
-        print(f"  │  Links externos encontrados ({len(ext_links)}):")
-        for lnk in ext_links[:10]:
-            print(f"  │    → {lnk}")
-    else:
-        for i, (title, url, snippet) in enumerate(results_found, 1):
-            print(f"  │  [{i}] {title}")
-            print(f"  │      URL: {url}")
-            print(f"  │      Snippet: {snippet}")
-            print(f"  │")
-
-    # Estadísticas rápidas de la página
-    all_a    = soup.find_all("a", href=True)
-    ext_a    = [a for a in all_a if a.get("href","").startswith("http") and "google" not in a["href"]]
-    social_a = [a for a in all_a if any(s in a.get("href","") for s in
-                ("facebook.com", "instagram.com", "tiktok.com"))]
-    print(f"  │  Total <a href>: {len(all_a)} | externos: {len(ext_a)} | sociales: {len(social_a)}")
-    if social_a:
-        print(f"  │  Links sociales detectados en la página:")
-        for a in social_a:
-            print(f"  │    → {_unwrap_google_url(a['href'])}")
-    print("  └──────────────────────────────────────────────────────────\n")
-
-
-# ── Extracción de página de Google ────────────────────────────────────────────
-
-def _extract_from_google_page(html: str, missing: set[str], lounge: dict) -> dict:
-    soup = BeautifulSoup(html, "lxml")
-    result = {}
-
-    all_links = [
-        (_unwrap_google_url(a.get("href", "")), a.get_text(strip=True))
-        for a in soup.find_all("a", href=True)
-    ]
-
-    # Detectar Knowledge Panel
-    kp = (
-        soup.find("div", {"id": "rhs"}) or
-        soup.find("div", {"id": "kp-wp-tab-overview"}) or
-        soup.find("div", {"class": lambda c: bool(c and any("kp-" in x for x in c))}) or
-        soup.find("div", {"data-attrid": re.compile(r"knowledge")})
-    )
-    kp_links = []
-    if kp:
-        kp_links = [
-            (_unwrap_google_url(a.get("href", "")), a.get_text(strip=True))
-            for a in kp.find_all("a", href=True)
-        ]
-        _dbg(f"  [Google] Knowledge Panel detectado ({len(kp_links)} links)")
-    else:
-        _dbg(f"  [Google] Sin Knowledge Panel — solo resultados orgánicos")
-        if DEBUG:
-            _debug_google_organic(soup, html)
-
-    def _process_links(links: list, source: str):
-        for href, text in links:
-            if not href or href.startswith("#"):
-                continue
-
-            # Website
-            if "website" in missing and "website" not in result:
-                try:
-                    parsed = urlparse(href)
-                    domain = parsed.netloc.lower().replace("www.", "")
-                    if (domain
-                            and parsed.scheme in ("http", "https")
-                            and not any(s in domain for s in SKIP_WEBSITE_DOMAINS)):
-                        result["website"] = href
-                        _dbg(f"  [Google/{source}] website: {href}")
-                except Exception:
-                    pass
-
-            # Social
-            for field, pattern in SOCIAL_RE.items():
-                if field not in missing or field in result:
-                    continue
-                match = pattern.search(href)
-                if match:
-                    handle = match.group(1).strip("/")
-                    _dbg(f"  [Google/{source}] {field}: handle='{handle}' en {href[:80]}")
-                    if handle.lower() in SKIP_HANDLES or len(handle) <= 1:
-                        _dbg(f"    ✗ RECHAZADO — handle en lista negra")
-                        continue
-                    url = _build_social_url(field, handle)
-                    if url:
-                        if _validate_social(url, lounge, source):
-                            result[field] = url
-
-            # Email en mailto:
-            if "email" in missing and "email" not in result:
-                if href.startswith("mailto:"):
-                    email = href.replace("mailto:", "").split("?")[0].strip().lower()
-                    domain = email.split("@")[-1] if "@" in email else ""
-                    if domain and domain not in JUNK_EMAIL_DOMAINS:
-                        result["email"] = email
-                        _dbg(f"  [Google/{source}] email: {email}")
-
-    # KP primero, luego orgánicos
-    _process_links(kp_links, "knowledge_panel")
-
-    remaining = (missing | {"website"}) - set(result.keys())
-    if remaining:
-        _process_links(all_links, "organic")
-
-    # Email en texto como último recurso
-    if "email" in missing and "email" not in result:
-        for e in EMAIL_RE.findall(html):
-            domain = e.split("@")[-1].lower()
-            if domain not in JUNK_EMAIL_DOMAINS and "." in domain and "google" not in domain:
-                result["email"] = e.lower()
-                _dbg(f"  [Google/text] email: {e}")
-                break
-
-    # Si el parser no encontró nada y hay KP, mostrar de todas formas los orgánicos
-    if DEBUG and not result and kp:
-        _dbg("  [Google] KP presente pero parser devolvió vacío — mostrando orgánicos:")
-        _debug_google_organic(soup, html)
-
-    _dbg(f"  [Google] Resultado final del parser: {result}")
-    return result
-
-
 # ── Playwright: scrape website ────────────────────────────────────────────────
 
 async def _scrape_website(page, url: str, missing: set[str], lounge: dict) -> dict:
     """
-    Usa el crawler multi-página de browser_enricher.
+    Delega al crawler multi-página de browser_enricher.
     Visita hasta MAX_PAGES páginas internas buscando los campos faltantes.
+    La URL normalizada (sin trailing slash, lowercase) se usa como clave de caché.
     """
     from enrichment.browser_enricher import scrape_website as _crawl
+
+    _cache_key = url.rstrip("/").lower()
+    if _cache_key in _website_cache:
+        print(f"[CACHE] WEBSITE HIT  | {url}")
+        return _website_cache[_cache_key]
+    print(f"[CACHE] WEBSITE MISS | {url}")
 
     _dbg(f"  [P1] Crawler iniciado en: {url}")
     try:
         result = await _crawl(url, page, missing=missing)
     except Exception as e:
-        logger.debug(f"Website crawl failed {url}: {e}")
+        # logger.warning (no debug) para que siempre aparezca aunque no haya --debug
+        logger.warning(f"[DIAG] scrape_website EXCEPCIÓN en {url}: {type(e).__name__}: {e}")
         result = {}
+
+    _website_cache[_cache_key] = result
 
     if DEBUG:
         print(f"\n  ┌─ scrape_website() devolvió ──────────────────────────")
@@ -450,37 +497,543 @@ async def _scrape_website(page, url: str, missing: set[str], lounge: dict) -> di
     return result
 
 
-# ── Playwright: búsqueda en Google ───────────────────────────────────────────
+# ── P2: Búsqueda en Google Search ─────────────────────────────────────────────
 
-async def _google_search(page, lounge: dict, missing: set[str]) -> dict:
+async def _google_search_hrefs(page, query: str) -> list[str]:
+    """
+    Ejecuta una búsqueda en Google y devuelve todos los <a href> absolutos del DOM.
+
+    Optimizaciones vs versión anterior:
+    - Stealth y goto() solo en la primera query (la página ya está en Google después).
+    - Cookie dialog solo en primera carga.
+    - Sleeps reducidos al mínimo funcional.
+    - TIMING logs para identificar cuellos de botella.
+    """
     from playwright_stealth import Stealth
 
-    name  = lounge.get("name", "")
-    city  = lounge.get("city", "")
-    state = lounge.get("state", "")
-    query = f"{name} {city} {state}"
+    _t_start = time.monotonic()
 
-    _dbg(f"  [Google] Buscando: \"{query}\"")
+    try:
+        # ── Decidir si hay que navegar a Google o reutilizar la pestaña ────────
+        # page.url es "about:blank" tras reset del pool, o una URL de google.com
+        # si venimos de una búsqueda anterior.
+        _on_google = "google.com" in page.url and "about:blank" not in page.url
+
+        if not _on_google:
+            # Primera búsqueda de este negocio (o tras reset): cargar Google.
+            # Stealth se registra como init_script → persiste en navegaciones
+            # posteriores dentro de la misma página sin llamarlo de nuevo.
+            _t0 = time.monotonic()
+            await Stealth().apply_stealth_async(page)
+            await page.goto(
+                "https://www.google.com",
+                timeout=20000,
+                wait_until="domcontentloaded",
+            )
+            print(f"[TIMING] goto google.com: {time.monotonic()-_t0:.2f}s")
+
+            # Pausa breve: la homepage necesita un momento antes de ser interactiva
+            await asyncio.sleep(random.uniform(0.35, 0.55))
+
+            # Diálogo de cookies — solo aparece en la primera carga
+            for _sel in (
+                'button[id="L2AGLb"]',
+                'button:has-text("Accept all")',
+                'button:has-text("Aceptar todo")',
+            ):
+                try:
+                    btn = page.locator(_sel)
+                    if await btn.is_visible(timeout=600):
+                        await btn.click()
+                        await asyncio.sleep(0.20)
+                        break
+                except Exception:
+                    pass
+        # else: ya estamos en resultados de Google → solo reutilizar el cuadro
+        #        de búsqueda.  Sin goto, sin stealth, sin cookie check.
+
+        # ── Localizar el cuadro de búsqueda visible y enviar ──────────────────
+        # Google tiene varios input[name="q"] en el DOM (uno visible, otros
+        # hidden). El selector excluye explícitamente type="hidden" y además
+        # filtra con .filter(has_text=...) → visible() para evitar cualquier
+        # elemento no interactivo.
+        #
+        # Estrategia:
+        #   1. Buscar un campo visible con name="q" que NO sea hidden.
+        #   2. Si no existe (página en estado extraño), navegar a google.com y
+        #      repetir la búsqueda del campo.  Nunca aumentar el timeout.
+        _BOX_SEL = 'textarea[name="q"], input[name="q"]:not([type="hidden"])'
+
+        # ── TIMING granular: localizar ────────────────────────────────────────
+        # page.locator() es síncrono (solo crea un objeto Locator, no toca el DOM)
+        _t0 = time.monotonic()
+        box = page.locator(_BOX_SEL).filter(visible=True).first
+        print(f"[TIMING]   locator():    {time.monotonic()-_t0:.3f}s")
+
+        # ── TIMING granular: is_visible() ────────────────────────────────────
+        _t0 = time.monotonic()
+        _box_visible = await box.is_visible()
+        print(f"[TIMING]   is_visible(): {time.monotonic()-_t0:.3f}s  → {_box_visible}")
+
+        if not _box_visible:
+            _dbg("[google] search box no visible, recargando google.com")
+            await page.goto(
+                "https://www.google.com",
+                timeout=20000,
+                wait_until="domcontentloaded",
+            )
+            await asyncio.sleep(random.uniform(0.35, 0.55))
+            box = page.locator(_BOX_SEL).filter(visible=True).first
+
+        # ── TIMING granular: click() ──────────────────────────────────────────
+        _t0 = time.monotonic()
+        await box.click(timeout=3000)
+        print(f"[TIMING]   click():      {time.monotonic()-_t0:.3f}s")
+
+        # ── TIMING granular: fill() ───────────────────────────────────────────
+        _t0 = time.monotonic()
+        await box.fill(query)
+        print(f"[TIMING]   fill():       {time.monotonic()-_t0:.3f}s")
+
+        await asyncio.sleep(random.uniform(0.12, 0.25))   # simular escritura humana
+
+        _t0 = time.monotonic()
+        await box.press("Enter")
+        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+        print(f"[TIMING] Enter + domcontentloaded: {time.monotonic()-_t0:.2f}s")
+
+        # Pausa mínima: los href de resultados ya están en el DOM tras
+        # domcontentloaded; Google no usa lazy-load crítico para links de texto.
+        await asyncio.sleep(random.uniform(0.20, 0.40))
+
+    except Exception as e:
+        logger.debug(f"[google] navegacion fallo '{query}': {e}")
+        return []
+
+    print(f"[TIMING] total nav+wait: {time.monotonic()-_t_start:.2f}s  query={query!r}")
+
+    try:
+        return await page.evaluate("""
+            () => {
+                const seen = new Set();
+                const out  = [];
+                for (const a of document.querySelectorAll('a[href]')) {
+                    const h = a.href;
+                    if (h && h.startsWith('http') && !seen.has(h)) {
+                        seen.add(h);
+                        out.push(h);
+                    }
+                }
+                return out;
+            }
+        """)
+    except Exception as e:
+        logger.debug(f"[google] evaluate fallo: {e}")
+        return []
+
+
+async def _search_google(
+    page,
+    query:         str,
+    target_domain: str,
+    field:         str,
+    lounge:        dict,
+) -> str | None:
+    """
+    Ejecuta UNA query en Google y devuelve el primer enlace válido de
+    `target_domain`, o None.  Imprime en DEBUG los primeros 10 hrefs con
+    el motivo de aceptación/rechazo para los que pertenecen al dominio.
+    """
+    # ── Caché de búsqueda ────────────────────────────────────────────────────
+    if query in _search_cache:
+        print(f"[CACHE] SEARCH HIT  | campo={field} | query={query!r}")
+        return _search_cache[query]
+    print(f"[CACHE] SEARCH MISS | campo={field} | query={query!r}")
+
+    _stats["engine_searches"] += 1
+
+    # ── Log de auditoría por llamada ────────────────────────────────────────
+    _lounge_id = lounge.get("id", lounge.get("name", "?"))
+    _key = (_lounge_id, field)
+    _search_call_counts[_key] = _search_call_counts.get(_key, 0) + 1
+    _call_n = _search_call_counts[_key]
+    print(
+        f"[SEARCH] call={_call_n}"
+        f" | {lounge.get('name', '?')!r}"
+        f" | campo={field}"
+        f" | query={query!r}"
+    )
+
+    _dbg(f"  [google] ── query: {query!r}")
+
+    hrefs = await _google_search_hrefs(page, query)
+    _dbg(f"  [google]    {len(hrefs)} enlaces encontrados en el DOM")
+
+    if DEBUG:
+        _dbg(f"  [google]    primeros 10 enlaces:")
+        for _i, _h in enumerate(hrefs[:10], 1):
+            _dbg(f"    {_i:2d}. {_h}")
+
+    # ── Email ─────────────────────────────────────────────────────────────────
+    if field == "email":
+        for href in hrefs:
+            if href.startswith("mailto:"):
+                em = href[7:].split("?")[0].strip().lower()
+                ok = _validate_email(em)
+                _dbg(f"  [google]    {'✓' if ok else '✗'} mailto:{em} — {'OK' if ok else 'rechazado por _validate_email'}")
+                if ok:
+                    return em
+        try:
+            body_text = await page.inner_text("body")
+        except Exception:
+            body_text = ""
+        for m in EMAIL_RE.finditer(body_text):
+            em = m.group(0).lower()
+            ok = _validate_email(em)
+            _dbg(f"  [google]    {'✓' if ok else '✗'} {em} — {'OK' if ok else 'rechazado por _validate_email'}")
+            if ok:
+                _search_cache[query] = em
+                return em
+        _dbg(f"  [google]    ✗ email — no encontrado")
+        _search_cache[query] = None
+        return None
+
+    # ── Sociales ──────────────────────────────────────────────────────────────
+    found = None
+    for url in hrefs:
+        if target_domain not in url.lower():
+            continue                                  # silencio: no es el dominio objetivo
+
+        m = SOCIAL_RE[field].search(url)
+        if not m:
+            _dbg(f"  [google]    ✗ {url[:90]} — sin match de regex ({field})")
+            continue
+
+        handle = m.group(1).strip("/")
+
+        if len(handle) <= 1:
+            _dbg(f"  [google]    ✗ {url[:90]} — handle demasiado corto: '{handle}'")
+            continue
+
+        if handle.lower() in SKIP_HANDLES:
+            _dbg(f"  [google]    ✗ {url[:90]} — handle '{handle}' en SKIP_HANDLES")
+            continue
+
+        built = _build_social_url(field, handle)
+        if not built:
+            _dbg(f"  [google]    ✗ {url[:90]} — _build_social_url devolvió None")
+            continue
+
+        if not _validate_social(built, lounge, "google"):
+            _dbg(f"  [google]    ✗ {url[:90]} — no pasa _validate_social")
+            continue
+
+        _dbg(f"  [google]    ✓ {field}: {built}")
+        found = built
+        break
+
+    if not found:
+        _dbg(f"  [google]    ✗ {field} — ningún enlace válido en esta query")
+    _search_cache[query] = found
+    return found
+
+
+async def _find_via_google(page, field: str, lounge: dict) -> str | None:
+    """
+    Prueba hasta 4 queries en Google para encontrar `field`.
+
+    Para redes sociales (facebook_url / instagram_url / tiktok_url):
+      1. "{name} {city} {state} {label}"
+      2. "{name} {label}"
+      3. "site:{domain} \"{name}\""
+      4. "site:{domain} {domain_root}"   (solo si hay website)
+
+    Para email:
+      1. "{name} {city} email"
+
+    Se detiene en la primera query que devuelva un resultado válido.
+    """
+    name   = lounge.get("name", "")
+    city   = lounge.get("city", "")
+    state  = lounge.get("state", "")
+    label  = _PLATFORM_QUERY_LABEL.get(field, field.replace("_url", ""))
+    domain = _PLATFORM_SITE.get(field, "")
+
+    # Raíz del dominio del website del negocio (para query 4)
+    domain_root = ""
+    website = lounge.get("website") or ""
+    if website:
+        try:
+            host = urlparse(website).netloc.lower()
+            host = re.sub(r"^www\.", "", host)
+            root = host.split(".")[0]
+            if len(root) >= 3:
+                domain_root = root
+        except Exception:
+            pass
+
+    if field == "email":
+        queries = [f"{name} {city} email"]
+    else:
+        queries = [
+            " ".join(filter(None, [name, city, state, label])),
+            f"{name} {label}",
+            f'site:{domain} "{name}"',
+        ]
+        if domain_root:
+            queries.append(f"site:{domain} {domain_root}")
+
+    _dbg(f"  [P2] {field}: {len(queries)} quier{'y' if len(queries) == 1 else 'ies'} a intentar")
+
+    for idx, q in enumerate(queries, 1):
+        _dbg(f"  [P2] {field} [{idx}/{len(queries)}]: {q!r}")
+        result = await _search_google(page, q, domain, field, lounge)
+        if result:
+            _dbg(f"  [P2] ✓ {field} encontrado con query {idx}: {result}")
+            return result
+        await asyncio.sleep(random.uniform(PAUSE_MIN, PAUSE_MAX))
+
+    _dbg(f"  [P2] ✗ {field} — agotadas las {len(queries)} queries")
+    return None
+
+
+
+
+
+
+
+
+# ── P1.5: Inspeccion de Google Maps ──────────────────────────────────────────
+
+async def _enrich_from_maps(page, lounge: dict, missing: set[str]) -> dict:
+    """
+    Fase P1.5: extrae links de la ficha de Google Maps del negocio.
+
+    Condicion de uso: el lounge tiene google_maps_url Y aun faltan campos.
+
+    Reutiliza exactamente los mismos validadores del pipeline:
+      - _validate_social() para Facebook, Instagram, TikTok
+      - _validate_email()  para email
+      - SOCIAL_RE / EMAIL_RE para extraccion
+      - _build_social_url() para construir URL canonica
+
+    Los resultados se devuelven con el mismo formato que P1 (scrape website)
+    para que el caller aplique la misma logica de merge.
+    """
+    from playwright_stealth import Stealth
+
+    maps_url = lounge.get("google_maps_url")
+    if not maps_url or not missing:
+        return {}
+
+    # ── Caché de Maps ────────────────────────────────────────────────────────
+    _maps_key = maps_url.strip().rstrip("/")
+    if _maps_key in _maps_cache:
+        print(f"[CACHE] MAPS HIT  | {maps_url}")
+        return _maps_cache[_maps_key]
+    print(f"[CACHE] MAPS MISS | {maps_url}")
+
+    name = lounge.get("name", "?")
+    logger.info(f"[P1.5] {name!r} | maps={maps_url!r} | missing={sorted(missing)}")
+
+    # --- DIAG: URL abierta ---
+    print(f"[MAPS-DIAG] ============================================================")
+    print(f"[MAPS-DIAG] Negocio : {name!r}")
+    print(f"[MAPS-DIAG] URL     : {maps_url}")
+    print(f"[MAPS-DIAG] Faltan  : {sorted(missing)}")
 
     try:
         await Stealth().apply_stealth_async(page)
-        search_url = f"https://www.google.com/search?q={url_quote(query)}&hl=en"
-        await page.goto(search_url, timeout=20000, wait_until="domcontentloaded")
-        await asyncio.sleep(random.uniform(PAUSE_MIN, PAUSE_MAX))
+        await page.goto(maps_url, timeout=9000, wait_until="domcontentloaded")
+        print(f"[MAPS-DIAG] page.goto() completado -- esperando 2.5s...")
+        await asyncio.sleep(2.5)
+
+        # Scroll dentro del panel para revelar secciones (website, redes, etc.)
+        scroll_result = await page.evaluate("""
+            () => {
+                const candidates = [
+                    ['div[role="main"]',  document.querySelector('div[role="main"]')],
+                    ['.m6QErb',           document.querySelector('.m6QErb')],
+                    ['#QA0Szd',           document.querySelector('#QA0Szd')],
+                    ['.siAUzd-neVct',     document.querySelector('.siAUzd-neVct')],
+                ];
+                for (const [sel, el] of candidates) {
+                    if (el) {
+                        el.scrollTop = 3000;
+                        return 'scrolled:' + sel;
+                    }
+                }
+                window.scrollTo(0, 3000);
+                return 'scrolled:window';
+            }
+        """)
+        print(f"[MAPS-DIAG] Scroll  : {scroll_result}")
+        await asyncio.sleep(1.0)
         html = await page.content()
-        _stats["google_searches"] += 1
-        search_missing = missing | {"website"}
-        return _extract_from_google_page(html, search_missing, lounge)
-    except Exception as e:
-        logger.debug(f"Google search failed for {name}: {e}")
+        print(f"[MAPS-DIAG] HTML len: {len(html)} chars")
+    except Exception as exc:
+        print(f"[MAPS-DIAG] ERROR navegando Maps: {exc}")
+        logger.warning(f"[P1.5] Error navegando Maps para {name!r}: {exc}")
         return {}
+
+    _stats["maps_queries"] += 1
+    soup = BeautifulSoup(html, "lxml")
+
+    # --- Contar hrefs RAW en el DOM (antes de filtrar) ---
+    all_dom_hrefs = soup.find_all("a", href=True)
+    http_dom_hrefs = [a.get("href","") for a in all_dom_hrefs if a.get("href","").startswith("http")]
+    print(f"[MAPS-DIAG] <a href> totales en DOM : {len(all_dom_hrefs)}")
+    print(f"[MAPS-DIAG] <a href> con http       : {len(http_dom_hrefs)}")
+
+    # Recopilar y deduplicar todos los hrefs del panel
+    raw: list[str] = []
+
+    for a in all_dom_hrefs:
+        href = a.get("href", "").strip()
+        if not href.startswith("http"):
+            continue
+        # Decodificar redirects de Google (/url?q=https://...)
+        if "google.com/url" in href or "/url?q=" in href:
+            try:
+                qs   = parse_qs(urlparse(href).query)
+                real = qs.get("q", qs.get("url", [""]))[0]
+                if real.startswith("http"):
+                    href = real
+            except Exception:
+                pass
+        raw.append(href)
+
+    # Complementar con URLs capturadas por regex en data-attributes del HTML
+    regex_urls = []
+    for m in re.finditer(r'https?://[A-Za-z0-9.\-_%/?#=&@:,;+!~*\'()]{6,}', html):
+        regex_urls.append(m.group(0).rstrip(".,;)'\""))
+    raw.extend(regex_urls)
+    print(f"[MAPS-DIAG] URLs por regex en HTML  : {len(regex_urls)}")
+
+    # Deduplicar conservando el primer orden de aparicion
+    seen_keys: set[str] = set()
+    links: list[str] = []
+    for lnk in raw:
+        key = lnk.split("?")[0].rstrip("/#").lower()
+        if key not in seen_keys:
+            seen_keys.add(key)
+            links.append(lnk)
+
+    print(f"[MAPS-DIAG] Total links unicos      : {len(links)}")
+
+    # --- DIAG: primeros 30 links ---
+    print(f"[MAPS-DIAG] Primeros 30 links:")
+    for _i, _lnk in enumerate(links[:30], 1):
+        print(f"[MAPS-DIAG]   {_i:2}. {_lnk}")
+
+    # --- DIAG: si menos de 5 links, volcar inicio del HTML ---
+    if len(links) < 5:
+        print(f"[MAPS-DIAG] ALERTA: menos de 5 links -- primeros 3000 chars del HTML:")
+        print(html[:3000])
+
+    # --- Conteos por categoria (sin ejecutar validadores aun) ---
+    _cnt_fb  = sum(1 for lnk in links if "facebook.com" in lnk.lower())
+    _cnt_ig  = sum(1 for lnk in links if "instagram.com" in lnk.lower())
+    _cnt_tt  = sum(1 for lnk in links if "tiktok.com"    in lnk.lower())
+    _cnt_em  = len(list(EMAIL_RE.finditer(html)))
+    _WS_SKIP_HOSTS = {
+        "google.", "goo.gl", "maps.app", "facebook.", "fb.com",
+        "instagram.", "tiktok.", "youtube.", "youtu.be", "yelp.", "tripadvisor.",
+    }
+    _cnt_ws = sum(
+        1 for lnk in links
+        if "." in urlparse(lnk).netloc
+        and not any(s in urlparse(lnk).netloc.lower() for s in _WS_SKIP_HOSTS)
+        and "google.com" not in urlparse(lnk).netloc.lower()
+    )
+    print(f"[MAPS-DIAG] Conteos por categoria:")
+    print(f"[MAPS-DIAG]   facebook  : {_cnt_fb}")
+    print(f"[MAPS-DIAG]   instagram : {_cnt_ig}")
+    print(f"[MAPS-DIAG]   tiktok    : {_cnt_tt}")
+    print(f"[MAPS-DIAG]   email     : {_cnt_em}")
+    print(f"[MAPS-DIAG]   website   : {_cnt_ws}")
+
+    found: dict = {}
+
+    # Email
+    if "email" in missing:
+        _email_candidates = [m.group(0).lower() for m in EMAIL_RE.finditer(html)]
+        for _ec in _email_candidates[:10]:
+            _ok = _validate_email(_ec)
+            print(f"[MAPS-DIAG]   email {'ACEPTADO' if _ok else 'RECHAZADO'}: {_ec}")
+            if _ok and "email" not in found:
+                found["email"] = _ec
+    else:
+        _email_candidates = []
+
+    # Redes sociales (Facebook, Instagram, TikTok)
+    for field in ("facebook_url", "instagram_url", "tiktok_url"):
+        if field not in missing or field in found:
+            continue
+        domain = _PLATFORM_SITE[field]
+        _platform_links = [lnk for lnk in links if domain in lnk.lower()]
+        for lnk in _platform_links:
+            m = SOCIAL_RE[field].search(lnk)
+            if not m:
+                print(f"[MAPS-DIAG]   {field} SKIP (sin regex match): {lnk}")
+                continue
+            handle = m.group(1).strip("/")
+            url = _build_social_url(field, handle)
+            if url and _validate_social(url, lounge, "maps"):
+                found[field] = url
+                print(f"[MAPS-DIAG]   {field} ACEPTADO: {url}")
+                break
+            else:
+                print(f"[MAPS-DIAG]   {field} RECHAZADO por _validate_social: {url}")
+
+    # Website (solo si el lounge no tenia ninguno)
+    if "website" in missing:
+        _WS_SKIP = {
+            "google.", "goo.gl", "maps.app", "maps.google.",
+            "facebook.", "fb.com", "instagram.", "tiktok.",
+            "youtube.", "youtu.be", "yelp.", "tripadvisor.",
+        }
+        for lnk in links:
+            try:
+                host = urlparse(lnk).netloc.lower()
+            except Exception:
+                continue
+            if not host or "." not in host:
+                continue
+            if any(s in host for s in _WS_SKIP):
+                continue
+            if "google.com" in host:
+                continue
+            found["website"] = lnk.split("?")[0].rstrip("/")
+            print(f"[MAPS-DIAG]   website ACEPTADO: {found['website']}")
+            break
+
+    if found:
+        logger.info(f"[P1.5] aporte de Maps para {name!r}: {list(found.keys())}")
+        print(f"[MAPS-DIAG] RESULTADO: {list(found.keys())}")
+    else:
+        print(f"[MAPS-DIAG] RESULTADO: sin datos")
+
+    print(f"[MAPS-DIAG] ============================================================")
+    _maps_cache[_maps_key] = found
+    return found
 
 
 # ── Enriquecimiento de un lounge ──────────────────────────────────────────────
 
 async def enrich_one(lounge: dict, browser, db, cache: dict) -> dict:
+    # Fase 0: si `website` es una red social, reclasificar antes de todo
+    lounge = await _normalize_website(lounge, db)
+
     name    = lounge.get("name", "")
-    missing = _missing_fields(lounge)
+    missing         = _missing_fields(lounge)
+    initial_missing = missing.copy()   # para filtrar el UPDATE final sin mutaciones
+
+    # Limpia los contadores de _search_google para este lounge (evita acumulación
+    # entre corridas si se reutiliza el proceso).
+    _lounge_id = lounge.get("id", name)
+    for _f in ("facebook_url", "instagram_url", "tiktok_url", "email"):
+        _search_call_counts.pop((_lounge_id, _f), None)
 
     if not missing:
         return {}
@@ -494,22 +1047,42 @@ async def enrich_one(lounge: dict, browser, db, cache: dict) -> dict:
     found   = {}
     website = lounge.get("website")
 
-    page = await browser.new_page()
+    # ── [DIAG] Checkpoint 0: estado inicial ──────────────────────────────────
+    logger.info(f"[DIAG] ▶ {name!r} | missing={sorted(missing)} | website={website!r}")
+
+    crawler_page = await browser.acquire_crawler()
+    maps_page    = await browser.acquire_maps()
+    google_page  = await browser.acquire_google()
     try:
         # ── PRIORIDAD 1: Scrape del website existente ────────────────────────
         if website:
             _stats["website_reused"] += 1
             _dbg(f"  [P1] Scrapeando website: {website}")
-            scraped = await _scrape_website(page, website, missing, lounge)
+            scraped = await _scrape_website(crawler_page, website, missing, lounge)
+
+            # ── [DIAG] Checkpoint 1: lo que devolvió scrape_website() ─────────
+            logger.info(f"[DIAG] scrape_website() → {scraped}")
+
             for k, v in scraped.items():
-                if v and k in missing:
+                if not v:
+                    continue
+                # Validacion extra para email
+                if k == "email" and not _validate_email(v):
+                    logger.info(f"[DIAG] campo 'email' descartado del scrape — rechazado por _validate_email: '{v}'")
+                    if DEBUG:
+                        _dbg(f"  [P1] 'email' ignorado — no pasa _validate_email: {v}")
+                    continue
+                # Guardar todo (no filtrar por missing aqui — el filtro va en el UPDATE)
+                if k not in found:
                     found[k] = v
-                elif DEBUG:
-                    if not v:
-                        _dbg(f"  [P1] '{k}' ignorado — valor vacío o None")
-                    elif k not in missing:
-                        _dbg(f"  [P1] '{k}' ignorado — ya existía en el registro (no estaba en missing)")
+                    if DEBUG:
+                        in_missing = k in missing
+                        _dbg(f"  [P1] '{k}' guardado{'' if in_missing else ' (campo ya existia en DB, se conserva para referencia)'}: {v}")
+
+            # ── [DIAG] Checkpoint 2: found después de fusionar P1 ─────────────
+            logger.info(f"[DIAG] found después de P1 = {found} | siguen faltando: {sorted(missing - set(found))}")
             missing -= set(found.keys())
+            _dbg(f"  [missing] Después de Website:     missing={sorted(missing)}")
 
             if DEBUG:
                 print(f"\n  ┌─ found después de P1 ────────────────────────────────")
@@ -520,47 +1093,143 @@ async def enrich_one(lounge: dict, browser, db, cache: dict) -> dict:
                     print(f"  │  (vacío — scrape no aportó nada nuevo)")
                 print(f"  │  Siguen faltando: {sorted(missing)}")
                 print(f"  └──────────────────────────────────────────────────────")
+        else:
+            logger.info(f"[DIAG] P1 omitida — lounge sin website")
 
-        # ── PRIORIDAD 2: Una sola búsqueda en Google ─────────────────────────
-        if missing:
-            cache_key = (name.lower(), lounge.get("city", "").lower(), lounge.get("state", "").lower())
+        # ── PRIORIDAD 1.5: Inspeccion de Google Maps ────────────────────────
+        if missing and lounge.get("google_maps_url"):
+            # Incluir website en la busqueda de Maps si el lounge no tenia ninguno
+            maps_target = set(missing)
+            if not lounge.get("website"):
+                maps_target.add("website")
 
-            if cache_key in cache:
-                _dbg(f"  [P2] Usando caché para '{name}'")
-                google_result = cache[cache_key]
-            else:
-                google_result = await _google_search(page, lounge, missing)
-                cache[cache_key] = google_result
+            _dbg(f"  [missing] Antes de Google Maps:   missing={sorted(missing)}")
+            _dbg(f"  [P1.5] Consultando Google Maps...")
+            maps_result = await _enrich_from_maps(maps_page, lounge, maps_target)
+            logger.info(f"[DIAG] Maps → {maps_result}")
 
-            new_website = google_result.get("website")
-            _dbg(f"  [P2] Google devolvió: {[k for k,v in google_result.items() if v]}")
-
-            for k, v in google_result.items():
-                if k == "website":
+            for k, v in maps_result.items():
+                if not v:
                     continue
-                if v and k in missing and k not in found:
+                if k == "website":
+                    # Website no esta en missing_fields pero lo guardamos si faltaba
+                    if not lounge.get("website") and "website" not in found:
+                        found["website"] = v
+                        lounge = {**lounge, "website": v}
+                elif k in missing:
+                    if k == "email" and not _validate_email(v):
+                        _dbg(f"  [P1.5] email descartado por _validate_email: {v}")
+                        continue
                     found[k] = v
-            missing -= set(found.keys())
 
-            # ── PRIORIDAD 3: Visitar el website nuevo encontrado ──────────────
-            if new_website and not website:
-                found["website"] = new_website
-                _stats["website_found"] += 1
-                _dbg(f"  [P3] Nuevo website: {new_website}")
-                if missing:
-                    scraped2 = await _scrape_website(page, new_website, missing, lounge)
-                    for k, v in scraped2.items():
-                        if v and k in missing and k not in found:
-                            found[k] = v
-                    missing -= set(found.keys())
-                    _dbg(f"  [P3] Encontrado: {list(scraped2.keys())} | Siguen faltando: {sorted(missing)}")
+            missing -= set(found.keys())
+            _dbg(f"  [missing] Después de Google Maps: missing={sorted(missing)}")
+
+            if DEBUG and maps_result:
+                maps_found = {k: v for k, v in found.items() if k in maps_result}
+                print(f"\n  ┌─ found despues de P1.5 (Maps) ───────────────────────")
+                if maps_found:
+                    for k, v in maps_found.items():
+                        print(f"  │  {k:<20} = {v}")
+                else:
+                    print(f"  │  (Maps no aperto datos nuevos)")
+                print(f"  │  Siguen faltando: {sorted(missing)}")
+                print(f"  └──────────────────────────────────────────────────────")
+
+        # ── PRIORIDAD 2: Google Search para campos faltantes ─────────────────
+        _P2_FIELDS = ("facebook_url", "instagram_url", "tiktok_url", "email")
+        _dbg(f"  [missing] Antes de Google Search: missing={sorted(missing)}")
+
+        # Lista exacta de campos que aún faltan — se calcula DESPUÉS de Website y
+        # Maps para reflejar su estado real. El loop itera solo sobre estos campos;
+        # no hay snapshots ni guards internos que puedan desincronizarse.
+        p2_needed = [f for f in _P2_FIELDS if f in missing]
+
+        # ── AUDITORÍA: estado justo antes de P2 ──────────────────────────────
+        _p2_searches_start = _stats["engine_searches"]
+        print(
+            f"[AUDIT] ▶ {name!r}"
+            f" | missing_pre_P2={sorted(missing)}"
+            f" | campos_a_buscar={p2_needed}"
+        )
+
+        if not p2_needed:
+            _dbg(f"  [P2] omitido — todos los campos P2 ya cubiertos por Website/Maps")
+        else:
+            _dbg(f"  [P2] {len(p2_needed)} campo(s) a buscar: {p2_needed}")
+
+            for idx, field in enumerate(p2_needed):
+                _dbg(f"  [P2] [{idx + 1}/{len(p2_needed)}] → {field} | missing={sorted(missing)}")
+
+                # ── AUDITORÍA: estado de missing justo antes de la búsqueda ─
+                # El conteo real de queries se lee de _search_call_counts DESPUÉS
+                # de la llamada — es por (lounge_id, field) y no se contamina con
+                # workers paralelos.
+                _lounge_key = (lounge.get("id", lounge.get("name")), field)
+                _calls_before = _search_call_counts.get(_lounge_key, 0)
+                print(
+                    f"[AUDIT]   campo={field}"
+                    f" | missing_antes={sorted(missing)}"
+                )
+
+                result = await _find_via_google(google_page, field, lounge)
+
+                _queries_this_field = _search_call_counts.get(_lounge_key, 0) - _calls_before
+                print(
+                    f"[AUDIT]   campo={field}"
+                    f" | queries_lanzadas={_queries_this_field}"
+                    f" | resultado={'✓ ' + result if result else '✗ no encontrado'}"
+                )
+
+                if result:
+                    found[field] = result
+                    missing.discard(field)
+                    _dbg(f"  [P2] ✓ {field} encontrado → missing={sorted(missing)}")
+                else:
+                    _dbg(f"  [P2] ✗ {field} no encontrado → missing={sorted(missing)}")
+                # Pausar entre campos, pero NO después del último
+                if idx < len(p2_needed) - 1:
+                    await asyncio.sleep(random.uniform(PAUSE_MIN, PAUSE_MAX))
+
+            _dbg(f"  [missing] Después de Google Search: missing={sorted(missing)}")
+
+        # ── AUDITORÍA: resumen por negocio ────────────────────────────────────
+        _p2_total = _stats["engine_searches"] - _p2_searches_start
+        print(
+            f"[AUDIT] ◀ {name!r}"
+            f" | búsquedas_P2={_p2_total}"
+            f" | encontrados={[f for f in p2_needed if f in found]}"
+            f" | missing_post_P2={sorted(missing)}"
+        )
+
+        # ── [DIAG] Checkpoint 3: found despues de P2 ──────────────────────
+        p2_all_fields = {"facebook_url", "instagram_url", "tiktok_url", "email"}
+        p2_keys = set(found) & p2_all_fields
+        logger.info(f"[DIAG] found despues de P2 = { {k: found[k] for k in p2_keys} } | discarded_total={_stats['discarded']}")
+
+        if DEBUG:
+            print(f"\n  ┌─ found despues de P2 ────────────────────────────────")
+            p2_found = {k: v for k, v in found.items() if k in p2_all_fields}
+            if p2_found:
+                for k, v in p2_found.items():
+                    print(f"  │  {k:<20} = {v}")
+            else:
+                print(f"  │  (vacio -- motores no aportaron nada)")
+            print(f"  │  Siguen faltando: {sorted(missing)}")
+            print(f"  └──────────────────────────────────────────────────────")
 
     finally:
-        await page.close()
+        await browser.release_crawler(crawler_page)
+        await browser.release_maps(maps_page)
+        await browser.release_google(google_page)
 
     # ── Guardar en DB ─────────────────────────────────────────────────────────
     if found:
-        update = {k: v for k, v in found.items() if v}
+        # Solo escribir columnas que faltaban originalmente (no sobreescribir datos existentes)
+        update = {k: v for k, v in found.items() if v and (k in initial_missing or k == "website")}
+
+        # ── [DIAG] Checkpoint 4: dict que va a Supabase ───────────────────────
+        logger.info(f"[DIAG] update → Supabase = {update} | lounge_id={lounge.get('id')!r}")
 
         if DEBUG:
             print(f"\n  ┌─ update enviado a Supabase ───────────────────────────")
@@ -576,28 +1245,31 @@ async def enrich_one(lounge: dict, browser, db, cache: dict) -> dict:
                 .eq("id", lounge["id"])
                 .execute()
             )
+            # ── [DIAG] Checkpoint 5: respuesta de Supabase ───────────────────
+
+            logger.info(f"[DIAG] Supabase resp.data = {resp.data!r}")
+
             if DEBUG:
                 rows = resp.data or []
-                print(f"  ✓ Supabase respondió: {len(rows)} fila(s) afectada(s)")
+                print(f"  Supabase respondio: {len(rows)} fila(s) afectada(s)")
                 if rows:
-                    # Mostrar qué columnas quedaron realmente escritas
                     updated_row = rows[0]
                     written = {k: updated_row.get(k) for k in update if k in updated_row}
-                    print(f"  ┌─ columnas confirmadas en DB ──────────────────────────")
                     for k, v in written.items():
-                        match = "✓" if str(v) == str(update[k]) else "✗ DIFIERE"
-                        print(f"  │  {k:<20} = {v}  {match}")
+                        match_sym = "OK" if str(v) == str(update[k]) else "DIFIERE"
+                        print(f"  {k:<20} = {v}  {match_sym}")
                     if not written:
-                        print(f"  │  (Supabase no devolvió el registro — normal sin .select())")
-                    print(f"  └──────────────────────────────────────────────────────")
+                        print("  (Supabase no devolvio el registro -- normal sin .select())")
         except Exception as e:
             logger.warning(f"DB update failed for {name}: {e}")
             if DEBUG:
-                print(f"  ✗ ERROR en DB update: {e}")
-    elif DEBUG:
-        print(f"\n  ── Sin datos nuevos — no se envió nada a Supabase")
+                print(f"  ERROR en DB update: {e}")
+    else:
+        logger.info(f"[DIAG] found vacio -- Supabase update omitido para {name!r}")
+        if DEBUG:
+            print("  Sin datos nuevos -- no se envio nada a Supabase")
 
-    # ── Actualizar estadísticas ───────────────────────────────────────────────
+    # Actualizar estadisticas
     _stats["processed"] += 1
     for field in ("email", "facebook_url", "instagram_url", "tiktok_url"):
         if found.get(field):
@@ -607,7 +1279,95 @@ async def enrich_one(lounge: dict, browser, db, cache: dict) -> dict:
     return found
 
 
-# ── Batch principal ───────────────────────────────────────────────────────────
+# ── Pool de Playwright ────────────────────────────────────────────────────────
+
+class PlaywrightPool:
+    """
+    Browser, Context y páginas reutilizables para toda la corrida.
+
+    Mantiene `concurrency` páginas para cada rol:
+      • crawler  — P1: website scraping
+      • maps     — P1.5: Google Maps
+      • google   — P2: Google Search
+
+    Las páginas se resetean a about:blank entre negocios en lugar de
+    cerrarse y recrearse, ahorrando ~100 ms por lounge.
+    """
+
+    def __init__(self, browser, context):
+        self._browser  = browser
+        self._context  = context
+        self._crawlers = asyncio.Queue()
+        self._maps     = asyncio.Queue()
+        self._googles  = asyncio.Queue()
+
+    @classmethod
+    async def create(cls, pw, concurrency: int) -> "PlaywrightPool":
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
+        _dbg("[PW] Browser creado")
+
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 800},
+        )
+        _dbg("[PW] Context creado")
+
+        pool = cls(browser, context)
+
+        for _ in range(concurrency):
+            pool._crawlers.put_nowait(await context.new_page())
+            pool._maps.put_nowait(await context.new_page())
+            pool._googles.put_nowait(await context.new_page())
+
+        _dbg(
+            f"[PW] {concurrency * 3} páginas pre-creadas "
+            f"({concurrency} × crawler + maps + google)"
+        )
+        return pool
+
+    @staticmethod
+    async def _reset(page) -> None:
+        """Navega a about:blank para dejar la página limpia sin destruirla."""
+        try:
+            await page.goto("about:blank", timeout=5000, wait_until="commit")
+        except Exception:
+            pass
+
+    async def acquire_crawler(self):
+        page = await self._crawlers.get()
+        _dbg("[PW] Reutilizando página crawler")
+        return page
+
+    async def release_crawler(self, page) -> None:
+        await self._reset(page)
+        self._crawlers.put_nowait(page)
+
+    async def acquire_maps(self):
+        page = await self._maps.get()
+        _dbg("[PW] Reutilizando página Maps")
+        return page
+
+    async def release_maps(self, page) -> None:
+        await self._reset(page)
+        self._maps.put_nowait(page)
+
+    async def acquire_google(self):
+        page = await self._googles.get()
+        _dbg("[PW] Reutilizando página Google")
+        return page
+
+    async def release_google(self, page) -> None:
+        await self._reset(page)
+        self._googles.put_nowait(page)
+
+    async def close(self) -> None:
+        _dbg("[PW] Cerrando Browser")
+        await self._browser.close()
+
+
+# Batch principal
 
 async def enrich_batch_async(lounges: list[dict], db, concurrency: int = CONCURRENCY):
     from playwright.async_api import async_playwright
@@ -616,42 +1376,59 @@ async def enrich_batch_async(lounges: list[dict], db, concurrency: int = CONCURR
     total     = len(lounges)
     done      = 0
     semaphore = asyncio.Semaphore(concurrency)
-    cache: dict = {}
 
-    # En modo DEBUG bajar la concurrencia para que los prints no se mezclen
+    _MISSING_KEYS = {
+        "email":         "email_missing",
+        "facebook_url":  "facebook_missing",
+        "instagram_url": "instagram_missing",
+        "tiktok_url":    "tiktok_missing",
+    }
+    for lounge in lounges:
+        for field, stat_key in _MISSING_KEYS.items():
+            if not lounge.get(field):
+                _stats[stat_key] += 1
+
     if DEBUG:
         concurrency = 1
+        semaphore = asyncio.Semaphore(concurrency)
+
+    cache: dict = {}
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-        )
+        pool = await PlaywrightPool.create(pw, concurrency)
 
         async def process(lounge):
             nonlocal done
+            print(f"[QUEUE] creando tarea para {lounge.get('name', '?')}")
             async with semaphore:
-                await enrich_one(lounge, browser, db, cache)
+                try:
+                    await enrich_one(lounge, pool, db, cache)
+                except Exception as exc:
+                    logger.warning(f"[QUEUE] enrich_one excepcion para {lounge.get('name')}: {exc}")
                 done += 1
                 if not DEBUG and (done % 5 == 0 or done == total):
                     elapsed = time.time() - _stats["start_time"]
-                    avg = elapsed / done if done else 0
+                    avg     = elapsed / done if done else 0
                     print(
                         f"  [{done}/{total}] "
-                        f"web:{_stats['website_found']} "
                         f"email:{_stats['email_found']} "
                         f"fb:{_stats['facebook_found']} "
                         f"ig:{_stats['instagram_found']} "
                         f"tt:{_stats['tiktok_found']} "
-                        f"searches:{_stats['google_searches']} "
+                        f"searches:{_stats['engine_searches']} "
                         f"avg:{avg:.1f}s",
                         end="\r",
                         flush=True,
                     )
 
         tasks = [process(l) for l in lounges]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await browser.close()
+        print(f"[QUEUE] total tareas creadas: {len(tasks)}")
+        print("[QUEUE] ejecutando asyncio.gather()")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                logger.warning(f"[QUEUE] tarea {i} termino con excepcion: {r}")
+        await pool.close()
 
     if not DEBUG:
         print()
@@ -660,19 +1437,34 @@ async def enrich_batch_async(lounges: list[dict], db, concurrency: int = CONCURR
 
 def _print_stats(total: int):
     elapsed = time.time() - _stats["start_time"]
-    avg = elapsed / _stats["processed"] if _stats["processed"] else 0
+    avg     = elapsed / _stats["processed"] if _stats["processed"] else 0
 
-    print(f"\n{'='*55}")
-    print(f"  RESULTADOS FINALES")
-    print(f"{'='*55}")
+    print("\n" + "=" * 55)
+    print("  RESULTADOS FINALES")
+    print("=" * 55)
     print(f"  Procesados               : {_stats['processed']}")
-    print(f"  Website encontrados      : {_stats['website_found']}")
     print(f"  Website reutilizados     : {_stats['website_reused']}")
     print(f"  Emails encontrados       : {_stats['email_found']}")
     print(f"  Facebook encontrados     : {_stats['facebook_found']}")
     print(f"  Instagram encontrados    : {_stats['instagram_found']}")
     print(f"  TikTok encontrados       : {_stats['tiktok_found']}")
-    print(f"  Búsquedas en Google      : {_stats['google_searches']}")
+    print(f"  Consultas Google Maps    : {_stats['maps_queries']}")
+    print(f"  Busquedas por motor      : {_stats['engine_searches']}")
     print(f"  Coincidencias descartadas: {_stats['discarded']}")
     print(f"  Tiempo promedio/negocio  : {avg:.1f}s")
-    print(f"{'='*55}\n")
+    print("=" * 55)
+
+    _COVERAGE = [
+        ("Facebook ", "facebook_found", "facebook_missing"),
+        ("Instagram", "instagram_found", "instagram_missing"),
+        ("TikTok   ", "tiktok_found",    "tiktok_missing"),
+        ("Email    ", "email_found",     "email_missing"),
+    ]
+    print("\n  Cobertura del enriquecimiento")
+    print("  " + "-" * 31)
+    for label, found_key, missing_key in _COVERAGE:
+        found   = _stats[found_key]
+        missing = _stats[missing_key]
+        pct     = (found / missing * 100) if missing else 0.0
+        print(f"  {label}: {found}/{missing} ({pct:.1f}%)")
+    print()

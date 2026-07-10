@@ -1,3 +1,12 @@
+# check_missing_states.py
+# Muestra los estados que no tienen ningún lounge en la base de datos.
+#
+# Run: venv\Scripts\python scripts\audit\check_missing_states.py
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
 from dotenv import load_dotenv
 load_dotenv()
 

@@ -40,7 +40,6 @@ def fill_from_google_places(lounges: list[dict]) -> int:
         if data:
             try:
                 db.client.table("cigar_lounges").update(data).eq("id", lounge["id"]).execute()
-                # Actualizar dict local para el paso 2
                 lounge.update(data)
                 updated += 1
             except Exception as e:
@@ -95,7 +94,6 @@ async def scrape_all_websites(lounges: list[dict]) -> dict:
                 finally:
                     await page.close()
 
-                # Solo guardar campos que faltan
                 update = {
                     k: v for k, v in {
                         "email":         scraped.get("email"),
@@ -103,7 +101,7 @@ async def scrape_all_websites(lounges: list[dict]) -> dict:
                         "facebook_url":  scraped.get("facebook_url"),
                         "tiktok_url":    scraped.get("tiktok_url"),
                     }.items()
-                    if v and not lounge.get(k)  # no sobreescribir si ya existe
+                    if v and not lounge.get(k)
                 }
                 update["enriched"] = True
 
@@ -115,7 +113,7 @@ async def scrape_all_websites(lounges: list[dict]) -> dict:
 
                 found = [k for k, v in update.items() if v and k != "enriched"]
                 done += 1
-                if "email"         in found: with_email  += 1
+                if "email" in found: with_email += 1
                 if any(s in found for s in ("instagram_url", "facebook_url", "tiktok_url")):
                     with_social += 1
 
@@ -136,7 +134,6 @@ async def main():
     print(f"  Enrichment — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}\n")
 
-    # Lounges incompletos: sin website, email o redes sociales
     resp = db.client.table("cigar_lounges") \
         .select("id,name,city,state,address,website,email,instagram_url,facebook_url,google_maps_url,enriched") \
         .or_("website.is.null,email.is.null,instagram_url.is.null,google_maps_url.is.null") \
@@ -150,15 +147,12 @@ async def main():
         print("Nada que enriquecer.")
         return
 
-    # ── Paso 1: Google Places ────────────────────────────────────────────────
     print("Paso 1: Google Places API → website + Google Maps URL")
     fill_from_google_places(lounges)
 
-    # ── Paso 2: Playwright scraping ──────────────────────────────────────────
     print("\nPaso 2: Playwright → email + redes sociales")
     stats = await scrape_all_websites(lounges)
 
-    # ── Marcar todos como enriched ───────────────────────────────────────────
     ids = [l["id"] for l in lounges]
     for i in range(0, len(ids), 500):
         db.client.table("cigar_lounges") \

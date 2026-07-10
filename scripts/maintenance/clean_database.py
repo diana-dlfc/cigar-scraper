@@ -3,6 +3,10 @@
 #
 # Run: venv\Scripts\python scripts\maintenance\clean_database.py
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
 from dotenv import load_dotenv
 load_dotenv()
 

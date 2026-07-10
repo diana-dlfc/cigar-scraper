@@ -2,7 +2,11 @@
 # Auditoría de registros sospechosos en cigar_lounges.
 # NO elimina ningún registro — solo genera un reporte.
 #
-# Run: venv\Scripts\python audit_non_cigar.py
+# Run: venv\Scripts\python scripts\audit\audit_non_cigar.py
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from collections import defaultdict
 from dotenv import load_dotenv

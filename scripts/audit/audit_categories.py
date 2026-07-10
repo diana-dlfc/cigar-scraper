@@ -2,7 +2,11 @@
 # Read-only. Muestra todas las categorías en cigar_lounges con estadísticas.
 #
 # Run:
-#   venv\Scripts\python audit_categories.py
+#   venv\Scripts\python scripts\audit\audit_categories.py
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from collections import defaultdict
 from dotenv import load_dotenv

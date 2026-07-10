@@ -6,8 +6,8 @@
 #   venv\Scripts\python enrich_google_maps.py TX
 #   venv\Scripts\python enrich_google_maps.py TX FL NY
 
-import asyncio
 import sys
+import asyncio
 from urllib.parse import quote
 from datetime import datetime
 from dotenv import load_dotenv
@@ -58,11 +58,8 @@ def load_records(state: str) -> list[dict]:
 
 
 # ── Extracción desde la página de un lugar ───────────────────────────────────
-# Reutiliza los mismos selectores que scrapers/google_maps.py y
-# enrich_categories.py para mantener consistencia.
 
 async def _get_category(page) -> str | None:
-    """Mismos selectores que enrich_categories.py."""
     for sel in [
         "div.DkEaL",
         "button[jsaction*='category']",
@@ -81,7 +78,6 @@ async def _get_category(page) -> str | None:
 
 
 async def _get_website(page) -> str | None:
-    """Mismos selectores que scrapers/google_maps.py _extract_place."""
     for sel in [
         'a[data-item-id="authority"]',
         'a[aria-label*="website"]',
@@ -97,7 +93,6 @@ async def _get_website(page) -> str | None:
 
 
 async def _get_phone(page) -> str | None:
-    """Mismos selectores que scrapers/google_maps.py _extract_place."""
     for sel in [
         'button[data-item-id^="phone"]',
         'button[aria-label*="hone"]',
@@ -114,11 +109,6 @@ async def _get_phone(page) -> str | None:
 # ── Navegación a la página del negocio ───────────────────────────────────────
 
 async def _navigate_to_place(page, name: str, city: str, state: str) -> bool:
-    """
-    Busca el negocio por nombre+ciudad+estado en Google Maps y
-    navega a su página de detalle. Devuelve True si llega a una página
-    de lugar, False si no encuentra nada.
-    """
     query = f"{name} {city} {state}"
     url   = MAPS_SEARCH.format(query=quote(query))
 
@@ -128,7 +118,6 @@ async def _navigate_to_place(page, name: str, city: str, state: str) -> bool:
         logger.debug(f"Navigation error for {name}: {e}")
         return False
 
-    # Aceptar consentimiento de cookies si aparece
     for sel in ['button[aria-label*="Accept"]', 'button[aria-label*="Aceptar"]']:
         try:
             await page.click(sel, timeout=2000)
@@ -136,7 +125,7 @@ async def _navigate_to_place(page, name: str, city: str, state: str) -> bool:
         except Exception:
             pass
 
-    # Caso 1: Google Maps muestra lista de resultados
+    # Caso 1: lista de resultados
     try:
         await page.wait_for_selector('div[role="feed"]', timeout=8000)
         first_link = page.locator('div[role="feed"] a[href*="/maps/place/"]').first
@@ -151,7 +140,7 @@ async def _navigate_to_place(page, name: str, city: str, state: str) -> bool:
     except PWTimeout:
         pass
 
-    # Caso 2: Google Maps redirigió directo a la página del lugar
+    # Caso 2: redirigió directo al lugar
     try:
         await page.wait_for_selector("h1", timeout=5000)
         return True
