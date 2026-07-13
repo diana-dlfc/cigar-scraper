@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python scrape_all_states.py",
-    "restartPolicyType": "NEVER"
+    "startCommand": "python pipeline/orchestrator.py",
+    "restartPolicyType": "ON_FAILURE"
   }
 }
