@@ -20,7 +20,8 @@ from urllib.parse import urlparse, parse_qs
 from loguru import logger
 from bs4 import BeautifulSoup
 
-CONCURRENCY = 5
+CONCURRENCY = 1
+_PAGE_DEAD = object()  # sentinel: página muerta, saltar queries restantes
 PAUSE_MIN   = 0.3
 PAUSE_MAX   = 0.8
 
@@ -33,6 +34,7 @@ SOCIAL_RE = {
     "facebook_url":  re.compile(r"facebook\.com/([A-Za-z0-9_.@\-]{2,60})(?:[/?]|$)", re.I),
     "instagram_url": re.compile(r"instagram\.com/([A-Za-z0-9_.]{2,30})(?:[/?]|$)", re.I),
     "tiktok_url":    re.compile(r"tiktok\.com/@([A-Za-z0-9_.]{2,30})(?:[/?]|$)", re.I),
+    "youtube_url":   re.compile(r"youtube\.com/(?:@|channel/|user/|c/)?([A-Za-z0-9_\-.]{2,80})(?:[/?]|$)", re.I),
 }
 
 SKIP_HANDLES = {
@@ -70,12 +72,19 @@ BLOCKED_INSTAGRAM_PATHS = frozenset({
     "legal",  # pagina legal de la plataforma
 })
 
+BLOCKED_YOUTUBE_PATHS = frozenset({
+    "results", "feed", "trending", "playlist", "premium",
+    "studio", "live", "clips", "hashtag", "creators",
+    "copyright", "ads", "policies", "howyoutubeworks",
+})
+
 # Mapa host -> set de paths extra bloqueados para esa plataforma.
 # Se consulta dentro de _validate_social() despues de BLOCKED_SOCIAL_PATHS.
 _PLATFORM_PATH_EXTRAS: dict = {
-    "facebook.com": BLOCKED_FACEBOOK_PATHS,
-    "fb.com":       BLOCKED_FACEBOOK_PATHS,
+    "facebook.com":  BLOCKED_FACEBOOK_PATHS,
+    "fb.com":        BLOCKED_FACEBOOK_PATHS,
     "instagram.com": BLOCKED_INSTAGRAM_PATHS,
+    "youtube.com":   BLOCKED_YOUTUBE_PATHS,
 }
 
 # Usernames de plataformas de construccion web y servicios conocidos que
@@ -143,6 +152,7 @@ _PLATFORM_SITE = {
     "facebook_url":  "facebook.com",
     "instagram_url": "instagram.com",
     "tiktok_url":    "tiktok.com",
+    "youtube_url":   "youtube.com",
 }
 
 # Etiqueta en lenguaje natural para cada campo — usada en la query de Google
@@ -150,6 +160,7 @@ _PLATFORM_QUERY_LABEL = {
     "facebook_url":  "Facebook",
     "instagram_url": "Instagram",
     "tiktok_url":    "TikTok",
+    "youtube_url":   "YouTube",
     "email":         "email",
 }
 
@@ -188,11 +199,13 @@ def _reset_stats():
         "facebook_found":    0,
         "instagram_found":   0,
         "tiktok_found":      0,
+        "youtube_found":     0,
         # campos que estaban vacíos al inicio (se pueblan en enrich_batch_async)
         "email_missing":     0,
         "facebook_missing":  0,
         "instagram_missing": 0,
         "tiktok_missing":    0,
+        "youtube_missing":   0,
         "engine_searches":   0,
         "maps_queries":      0,
         "discarded":         0,
@@ -205,7 +218,7 @@ def _reset_stats():
 
 
 def _missing_fields(lounge: dict) -> set[str]:
-    fields = {"email", "facebook_url", "instagram_url", "tiktok_url"}
+    fields = {"email", "facebook_url", "instagram_url", "tiktok_url", "youtube_url"}
     return {f for f in fields if not lounge.get(f)}
 
 
@@ -381,6 +394,8 @@ _SOCIAL_HOSTS: dict[str, str] = {
     "instagram.com":  "instagram_url",
     "tiktok.com":     "tiktok_url",
     "vm.tiktok.com":  "tiktok_url",
+    "youtube.com":    "youtube_url",
+    "youtu.be":       "youtube_url",
 }
 
 
@@ -456,6 +471,11 @@ def _build_social_url(field: str, handle: str) -> str | None:
         return f"https://facebook.com/{handle}"
     if "tiktok" in field:
         return f"https://tiktok.com/@{handle}"
+    if "youtube" in field:
+        # Channel IDs start with UC + 22 chars; everything else gets @handle
+        if re.match(r"^UC[A-Za-z0-9_\-]{22}$", handle):
+            return f"https://youtube.com/channel/{handle}"
+        return f"https://youtube.com/@{handle}"
     return None
 
 
@@ -476,11 +496,18 @@ async def _scrape_website(page, url: str, missing: set[str], lounge: dict) -> di
     print(f"[CACHE] WEBSITE MISS | {url}")
 
     _dbg(f"  [P1] Crawler iniciado en: {url}")
+    logger.info(f"[PW] browser_enricher → scrape_website({url!r}) ...")
+    _t_crawl = time.monotonic()
     try:
-        result = await _crawl(url, page, missing=missing)
+        result = await asyncio.wait_for(_crawl(url, page, missing=missing), timeout=90)
+        logger.info(f"[PW] browser_enricher → scrape_website() completado en {time.monotonic()-_t_crawl:.1f}s")
+    except asyncio.TimeoutError:
+        logger.warning(f"[PW] scrape_website() TIMEOUT 90s en {url} — página probablemente crasheada, devolviendo {{}}")
+        result = {}
     except Exception as e:
         # logger.warning (no debug) para que siempre aparezca aunque no haya --debug
         logger.warning(f"[DIAG] scrape_website EXCEPCIÓN en {url}: {type(e).__name__}: {e}")
+        logger.info(f"[PW] browser_enricher → scrape_website() EXCEPCIÓN en {time.monotonic()-_t_crawl:.1f}s")
         result = {}
 
     _website_cache[_cache_key] = result
@@ -572,7 +599,20 @@ async def _google_search_hrefs(page, query: str) -> list[str]:
 
         # ── TIMING granular: is_visible() ────────────────────────────────────
         _t0 = time.monotonic()
-        _box_visible = await box.is_visible()
+        try:
+            _box_visible = await asyncio.wait_for(box.is_visible(), timeout=2)
+        except asyncio.TimeoutError:
+            logger.warning("[google] is_visible() TIMEOUT 2s — página no responde, intentando soft reset")
+            try:
+                await asyncio.wait_for(
+                    page.goto("about:blank", timeout=3000, wait_until="commit"),
+                    timeout=5,
+                )
+                logger.info("[google] soft reset OK — página volvió a about:blank")
+                return []   # reset OK, página usable pero vacía
+            except Exception as _rst_exc:
+                logger.warning(f"[google] soft reset FALLÓ ({type(_rst_exc).__name__}) — página permanece muerta")
+                return None  # señal de página muerta: saltar queries restantes
         print(f"[TIMING]   is_visible(): {time.monotonic()-_t0:.3f}s  → {_box_visible}")
 
         if not _box_visible:
@@ -613,20 +653,26 @@ async def _google_search_hrefs(page, query: str) -> list[str]:
     print(f"[TIMING] total nav+wait: {time.monotonic()-_t_start:.2f}s  query={query!r}")
 
     try:
-        return await page.evaluate("""
-            () => {
-                const seen = new Set();
-                const out  = [];
-                for (const a of document.querySelectorAll('a[href]')) {
-                    const h = a.href;
-                    if (h && h.startsWith('http') && !seen.has(h)) {
-                        seen.add(h);
-                        out.push(h);
+        return await asyncio.wait_for(
+            page.evaluate("""
+                () => {
+                    const seen = new Set();
+                    const out  = [];
+                    for (const a of document.querySelectorAll('a[href]')) {
+                        const h = a.href;
+                        if (h && h.startsWith('http') && !seen.has(h)) {
+                            seen.add(h);
+                            out.push(h);
+                        }
                     }
+                    return out;
                 }
-                return out;
-            }
-        """)
+            """),
+            timeout=15,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("[google] page.evaluate() TIMEOUT 15s extrayendo hrefs — página probablemente rota")
+        return []
     except Exception as e:
         logger.debug(f"[google] evaluate fallo: {e}")
         return []
@@ -667,6 +713,9 @@ async def _search_google(
     _dbg(f"  [google] ── query: {query!r}")
 
     hrefs = await _google_search_hrefs(page, query)
+    if hrefs is None:
+        # Página muerta — no cachear, propagar sentinel para saltar queries restantes
+        return _PAGE_DEAD
     _dbg(f"  [google]    {len(hrefs)} enlaces encontrados en el DOM")
 
     if DEBUG:
@@ -773,7 +822,14 @@ async def _find_via_google(page, field: str, lounge: dict) -> str | None:
             pass
 
     if field == "email":
-        queries = [f"{name} {city} email"]
+        queries = [
+            f"{name} {city} email",
+            f'"{name}" {state} email OR contact',
+            f"{name} {city} {state} chamber commerce",
+            f'"{name}" {city} site:yellowpages.com OR site:bbb.org',
+        ]
+        # Filtrar queries vacías si city/state no están disponibles
+        queries = [q for q in queries if q.strip()]
     else:
         queries = [
             " ".join(filter(None, [name, city, state, label])),
@@ -788,6 +844,9 @@ async def _find_via_google(page, field: str, lounge: dict) -> str | None:
     for idx, q in enumerate(queries, 1):
         _dbg(f"  [P2] {field} [{idx}/{len(queries)}]: {q!r}")
         result = await _search_google(page, q, domain, field, lounge)
+        if result is _PAGE_DEAD:
+            logger.warning(f"[P2] página muerta en campo={field} query={idx} — saltando queries restantes")
+            return _PAGE_DEAD
         if result:
             _dbg(f"  [P2] ✓ {field} encontrado con query {idx}: {result}")
             return result
@@ -844,32 +903,56 @@ async def _enrich_from_maps(page, lounge: dict, missing: set[str]) -> dict:
 
     try:
         await Stealth().apply_stealth_async(page)
+        logger.info(f"[PW] _enrich_from_maps → page.goto({maps_url!r}) ...")
         await page.goto(maps_url, timeout=9000, wait_until="domcontentloaded")
+        logger.info(f"[PW] _enrich_from_maps → page.goto() OK")
         print(f"[MAPS-DIAG] page.goto() completado -- esperando 2.5s...")
         await asyncio.sleep(2.5)
+        logger.info(f"[PW] _enrich_from_maps → sleep(2.5) OK — entrando a page.evaluate() scroll ...")
 
         # Scroll dentro del panel para revelar secciones (website, redes, etc.)
-        scroll_result = await page.evaluate("""
-            () => {
-                const candidates = [
-                    ['div[role="main"]',  document.querySelector('div[role="main"]')],
-                    ['.m6QErb',           document.querySelector('.m6QErb')],
-                    ['#QA0Szd',           document.querySelector('#QA0Szd')],
-                    ['.siAUzd-neVct',     document.querySelector('.siAUzd-neVct')],
-                ];
-                for (const [sel, el] of candidates) {
-                    if (el) {
-                        el.scrollTop = 3000;
-                        return 'scrolled:' + sel;
+        try:
+            scroll_result = await asyncio.wait_for(
+                page.evaluate("""
+                    () => {
+                        const candidates = [
+                            ['div[role="main"]',  document.querySelector('div[role="main"]')],
+                            ['.m6QErb',           document.querySelector('.m6QErb')],
+                            ['#QA0Szd',           document.querySelector('#QA0Szd')],
+                            ['.siAUzd-neVct',     document.querySelector('.siAUzd-neVct')],
+                        ];
+                        for (const [sel, el] of candidates) {
+                            if (el) {
+                                el.scrollTop = 3000;
+                                return 'scrolled:' + sel;
+                            }
+                        }
+                        window.scrollTo(0, 3000);
+                        return 'scrolled:window';
                     }
-                }
-                window.scrollTo(0, 3000);
-                return 'scrolled:window';
-            }
-        """)
+                """),
+                timeout=15,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[PW] _enrich_from_maps → page.evaluate() TIMEOUT 15s para {name!r} "
+                f"— página probablemente rota, _reset() la reemplazará al liberar"
+            )
+            return {}
+        logger.info(f"[PW] _enrich_from_maps → page.evaluate() scroll OK: {scroll_result}")
         print(f"[MAPS-DIAG] Scroll  : {scroll_result}")
+        logger.info(f"[PW] _enrich_from_maps → sleep(1.0) ...")
         await asyncio.sleep(1.0)
-        html = await page.content()
+        logger.info(f"[PW] _enrich_from_maps → sleep(1.0) OK — entrando a page.content() ...")
+        try:
+            html = await asyncio.wait_for(page.content(), timeout=20)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[PW] _enrich_from_maps → page.content() TIMEOUT 20s para {name!r} "
+                f"— página probablemente rota, _reset() la reemplazará al liberar"
+            )
+            return {}
+        logger.info(f"[PW] _enrich_from_maps → page.content() OK — {len(html)} chars")
         print(f"[MAPS-DIAG] HTML len: {len(html)} chars")
     except Exception as exc:
         print(f"[MAPS-DIAG] ERROR navegando Maps: {exc}")
@@ -935,6 +1018,7 @@ async def _enrich_from_maps(page, lounge: dict, missing: set[str]) -> dict:
     _cnt_fb  = sum(1 for lnk in links if "facebook.com" in lnk.lower())
     _cnt_ig  = sum(1 for lnk in links if "instagram.com" in lnk.lower())
     _cnt_tt  = sum(1 for lnk in links if "tiktok.com"    in lnk.lower())
+    _cnt_yt  = sum(1 for lnk in links if "youtube.com"   in lnk.lower() or "youtu.be" in lnk.lower())
     _cnt_em  = len(list(EMAIL_RE.finditer(html)))
     _WS_SKIP_HOSTS = {
         "google.", "goo.gl", "maps.app", "facebook.", "fb.com",
@@ -950,6 +1034,7 @@ async def _enrich_from_maps(page, lounge: dict, missing: set[str]) -> dict:
     print(f"[MAPS-DIAG]   facebook  : {_cnt_fb}")
     print(f"[MAPS-DIAG]   instagram : {_cnt_ig}")
     print(f"[MAPS-DIAG]   tiktok    : {_cnt_tt}")
+    print(f"[MAPS-DIAG]   youtube   : {_cnt_yt}")
     print(f"[MAPS-DIAG]   email     : {_cnt_em}")
     print(f"[MAPS-DIAG]   website   : {_cnt_ws}")
 
@@ -967,7 +1052,7 @@ async def _enrich_from_maps(page, lounge: dict, missing: set[str]) -> dict:
         _email_candidates = []
 
     # Redes sociales (Facebook, Instagram, TikTok)
-    for field in ("facebook_url", "instagram_url", "tiktok_url"):
+    for field in ("facebook_url", "instagram_url", "tiktok_url", "youtube_url"):
         if field not in missing or field in found:
             continue
         domain = _PLATFORM_SITE[field]
@@ -1050,10 +1135,19 @@ async def enrich_one(lounge: dict, browser, db, cache: dict) -> dict:
     # ── [DIAG] Checkpoint 0: estado inicial ──────────────────────────────────
     logger.info(f"[DIAG] ▶ {name!r} | missing={sorted(missing)} | website={website!r}")
 
-    crawler_page = await browser.acquire_crawler()
-    maps_page    = await browser.acquire_maps()
-    google_page  = await browser.acquire_google()
+    crawler_page = None
+    maps_page    = None
+    google_page  = None
     try:
+        logger.info(f"[PW] {name!r} → acquire_crawler() ...")
+        crawler_page = await browser.acquire_crawler()
+        logger.info(f"[PW] {name!r} → acquire_crawler() OK")
+        logger.info(f"[PW] {name!r} → acquire_maps() ...")
+        maps_page    = await browser.acquire_maps()
+        logger.info(f"[PW] {name!r} → acquire_maps() OK")
+        logger.info(f"[PW] {name!r} → acquire_google() ...")
+        google_page  = await browser.acquire_google()
+        logger.info(f"[PW] {name!r} → acquire_google() OK")
         # ── PRIORIDAD 1: Scrape del website existente ────────────────────────
         if website:
             _stats["website_reused"] += 1
@@ -1137,7 +1231,7 @@ async def enrich_one(lounge: dict, browser, db, cache: dict) -> dict:
                 print(f"  └──────────────────────────────────────────────────────")
 
         # ── PRIORIDAD 2: Google Search para campos faltantes ─────────────────
-        _P2_FIELDS = ("facebook_url", "instagram_url", "tiktok_url", "email")
+        _P2_FIELDS = ("facebook_url", "instagram_url", "tiktok_url", "youtube_url", "email")
         _dbg(f"  [missing] Antes de Google Search: missing={sorted(missing)}")
 
         # Lista exacta de campos que aún faltan — se calcula DESPUÉS de Website y
@@ -1173,6 +1267,9 @@ async def enrich_one(lounge: dict, browser, db, cache: dict) -> dict:
                 )
 
                 result = await _find_via_google(google_page, field, lounge)
+                if result is _PAGE_DEAD:
+                    logger.warning(f"[P2] página muerta detectada en campo={field} — saltando todos los campos restantes")
+                    break
 
                 _queries_this_field = _search_call_counts.get(_lounge_key, 0) - _calls_before
                 print(
@@ -1219,14 +1316,45 @@ async def enrich_one(lounge: dict, browser, db, cache: dict) -> dict:
             print(f"  └──────────────────────────────────────────────────────")
 
     finally:
-        await browser.release_crawler(crawler_page)
-        await browser.release_maps(maps_page)
-        await browser.release_google(google_page)
+        if crawler_page is not None:
+            logger.info(f"[PW] {name!r} → release_crawler() ...")
+            await browser.release_crawler(crawler_page)
+            logger.info(f"[PW] {name!r} → release_crawler() OK")
+        if maps_page is not None:
+            logger.info(f"[PW] {name!r} → release_maps() ...")
+            await browser.release_maps(maps_page)
+            logger.info(f"[PW] {name!r} → release_maps() OK")
+        if google_page is not None:
+            logger.info(f"[PW] {name!r} → release_google() ...")
+            await browser.release_google(google_page)
+            logger.info(f"[PW] {name!r} → release_google() OK")
 
     # ── Guardar en DB ─────────────────────────────────────────────────────────
     if found:
         # Solo escribir columnas que faltaban originalmente (no sobreescribir datos existentes)
         update = {k: v for k, v in found.items() if v and (k in initial_missing or k == "website")}
+        # Descartar URLs de schema.org — son metadatos de JSON-LD, no sitios reales
+        if update.get("website") and "schema.org" in update.get("website", ""):
+            logger.warning(f"[FILTER] website descartado por ser schema.org: {update['website']!r}")
+            del update["website"]
+        # Descartar URLs genéricas/pixel de Facebook/Instagram/TikTok — no son páginas de negocio
+        _FAKE_SOCIAL = {
+            "facebook_url":  ["facebook.com/tr", "facebook.com/recover", "facebook.com/login",
+                               "facebook.com/help", "facebook.com/policies", "facebook.com/privacy"],
+            "instagram_url": ["instagram.com/accounts", "instagram.com/legal"],
+            "tiktok_url":    ["tiktok.com/legal", "tiktok.com/privacy"],
+            "youtube_url":   ["youtube.com/results", "youtube.com/feed", "youtube.com/watch",
+                               "youtube.com/trending", "youtube.com/premium", "youtube.com/about"],
+        }
+        for _field, _bad_patterns in _FAKE_SOCIAL.items():
+            _val = update.get(_field, "")
+            if _val and any(p in _val for p in _bad_patterns):
+                logger.warning(f"[FILTER] {_field} descartado por ser URL genérica: {_val!r}")
+                del update[_field]
+        if update:
+            from datetime import datetime, timezone
+            update["enriched"] = True
+            update["last_enriched_at"] = datetime.now(timezone.utc).isoformat()
 
         # ── [DIAG] Checkpoint 4: dict que va a Supabase ───────────────────────
         logger.info(f"[DIAG] update → Supabase = {update} | lounge_id={lounge.get('id')!r}")
@@ -1239,12 +1367,31 @@ async def enrich_one(lounge: dict, browser, db, cache: dict) -> dict:
             print(f"  └──────────────────────────────────────────────────────")
 
         try:
-            resp = (
-                db.client.table("cigar_lounges")
-                .update(update)
-                .eq("id", lounge["id"])
-                .execute()
-            )
+            logger.info(f"[PW] Supabase update → id={lounge.get('id')!r} campos={list(update.keys())} ...")
+            try:
+                resp = (
+                    db.client.table("cigar_lounges")
+                    .update(update)
+                    .eq("id", lounge["id"])
+                    .execute()
+                )
+            except Exception as _db_exc:
+                _exc_str = str(_db_exc)
+                if "last_enriched_at" in _exc_str or "PGRST204" in _exc_str:
+                    logger.warning(
+                        f"[PW] Columna 'last_enriched_at' no existe en Supabase "
+                        f"— reintentando sin ella para {name!r}"
+                    )
+                    _update_retry = {k: v for k, v in update.items() if k != "last_enriched_at"}
+                    resp = (
+                        db.client.table("cigar_lounges")
+                        .update(_update_retry)
+                        .eq("id", lounge["id"])
+                        .execute()
+                    )
+                else:
+                    raise
+            logger.info(f"[PW] Supabase update → OK  filas={len(resp.data or [])}")
             # ── [DIAG] Checkpoint 5: respuesta de Supabase ───────────────────
 
             logger.info(f"[DIAG] Supabase resp.data = {resp.data!r}")
@@ -1271,7 +1418,7 @@ async def enrich_one(lounge: dict, browser, db, cache: dict) -> dict:
 
     # Actualizar estadisticas
     _stats["processed"] += 1
-    for field in ("email", "facebook_url", "instagram_url", "tiktok_url"):
+    for field in ("email", "facebook_url", "instagram_url", "tiktok_url", "youtube_url"):
         if found.get(field):
             key = field.split("_")[0] + "_found"
             _stats[key] += 1
@@ -1294,18 +1441,28 @@ class PlaywrightPool:
     cerrarse y recrearse, ahorrando ~100 ms por lounge.
     """
 
-    def __init__(self, browser, context):
-        self._browser  = browser
-        self._context  = context
-        self._crawlers = asyncio.Queue()
-        self._maps     = asyncio.Queue()
-        self._googles  = asyncio.Queue()
+    _LAUNCH_ARGS = [
+        "--no-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",   # Docker: usa /tmp en vez de /dev/shm (64 MB)
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+    ]
+
+    def __init__(self, pw, browser, context, concurrency: int):
+        self._pw          = pw
+        self._browser     = browser
+        self._context     = context
+        self._concurrency = concurrency
+        self._crawlers    = asyncio.Queue()
+        self._maps        = asyncio.Queue()
+        self._googles     = asyncio.Queue()
 
     @classmethod
     async def create(cls, pw, concurrency: int) -> "PlaywrightPool":
         browser = await pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            args=cls._LAUNCH_ARGS,
         )
         _dbg("[PW] Browser creado")
 
@@ -1314,7 +1471,7 @@ class PlaywrightPool:
         )
         _dbg("[PW] Context creado")
 
-        pool = cls(browser, context)
+        pool = cls(pw, browser, context, concurrency)
 
         for _ in range(concurrency):
             pool._crawlers.put_nowait(await context.new_page())
@@ -1327,40 +1484,109 @@ class PlaywrightPool:
         )
         return pool
 
-    @staticmethod
-    async def _reset(page) -> None:
-        """Navega a about:blank para dejar la página limpia sin destruirla."""
+    async def _full_restart(self) -> None:
+        """
+        Cierra el browser completo y crea uno nuevo desde cero.
+        Se usa cuando el proceso Chromium está muerto (todas las páginas
+        crashean inmediatamente al navegar, incluso las recién creadas).
+        Las colas de páginas quedan vacías — _reset() repoblará con
+        la página de reemplazo que devuelve.
+        """
+        logger.warning("[PW] FULL RESTART — el proceso Chromium está muerto, reiniciando browser completo")
+        try:
+            await self._browser.close()
+        except Exception as _e:
+            logger.debug(f"[PW] full_restart: error cerrando browser muerto: {_e}")
+        try:
+            self._browser = await self._pw.chromium.launch(
+                headless=True,
+                args=self._LAUNCH_ARGS,
+            )
+            self._context = await self._browser.new_context(
+                viewport={"width": 1280, "height": 800},
+            )
+            logger.info("[PW] FULL RESTART OK — browser y context recreados")
+        except Exception as _e:
+            logger.error(f"[PW] FULL RESTART FALLÓ: {_e}")
+            raise
+
+    async def _reset(self, page, pool_name: str = "?"):
+        """
+        Navega a about:blank para limpiar la página entre usos.
+        Si la página crasheada, cierra y crea reemplazo.
+        Si el context/browser está muerto, hace full restart primero.
+        Siempre devuelve una página utilizable.
+        """
         try:
             await page.goto("about:blank", timeout=5000, wait_until="commit")
-        except Exception:
-            pass
+            return page
+        except Exception as exc:
+            logger.warning(
+                f"[PW] pool '{pool_name}' página crasheada "
+                f"({type(exc).__name__}) — cerrando y creando reemplazo"
+            )
+            try:
+                await page.close()
+            except Exception:
+                pass
+            try:
+                new_page = await asyncio.wait_for(self._context.new_page(), timeout=10)
+                # Verificar que la nueva página funcione
+                await asyncio.wait_for(
+                    new_page.goto("about:blank", timeout=3000, wait_until="commit"),
+                    timeout=5,
+                )
+                logger.info(f"[PW] pool '{pool_name}' → página de reemplazo creada OK")
+                return new_page
+            except Exception as _new_exc:
+                # Context/browser muerto — full restart
+                logger.warning(
+                    f"[PW] pool '{pool_name}' — new_page() falló ({type(_new_exc).__name__}) "
+                    f"— el browser está muerto, ejecutando full restart"
+                )
+                await self._full_restart()
+                new_page = await self._context.new_page()
+                logger.info(f"[PW] pool '{pool_name}' → página de reemplazo post-restart OK")
+                return new_page
 
     async def acquire_crawler(self):
-        page = await self._crawlers.get()
+        try:
+            page = await asyncio.wait_for(self._crawlers.get(), timeout=60)
+        except asyncio.TimeoutError:
+            logger.error("[PW] TIMEOUT: pool 'crawler' sin páginas disponibles tras 60s")
+            raise
         _dbg("[PW] Reutilizando página crawler")
         return page
 
     async def release_crawler(self, page) -> None:
-        await self._reset(page)
-        self._crawlers.put_nowait(page)
+        clean = await self._reset(page, "crawler")
+        self._crawlers.put_nowait(clean)
 
     async def acquire_maps(self):
-        page = await self._maps.get()
+        try:
+            page = await asyncio.wait_for(self._maps.get(), timeout=60)
+        except asyncio.TimeoutError:
+            logger.error("[PW] TIMEOUT: pool 'maps' sin páginas disponibles tras 60s")
+            raise
         _dbg("[PW] Reutilizando página Maps")
         return page
 
     async def release_maps(self, page) -> None:
-        await self._reset(page)
-        self._maps.put_nowait(page)
+        clean = await self._reset(page, "maps")
+        self._maps.put_nowait(clean)
 
     async def acquire_google(self):
-        page = await self._googles.get()
+        try:
+            page = await asyncio.wait_for(self._googles.get(), timeout=60)
+        except asyncio.TimeoutError:
+            logger.error("[PW] TIMEOUT: pool 'google' sin páginas disponibles tras 60s")
+            raise
         _dbg("[PW] Reutilizando página Google")
         return page
 
     async def release_google(self, page) -> None:
-        await self._reset(page)
-        self._googles.put_nowait(page)
+        clean = await self._reset(page, "google")
+        self._googles.put_nowait(clean)
 
     async def close(self) -> None:
         _dbg("[PW] Cerrando Browser")
@@ -1382,6 +1608,7 @@ async def enrich_batch_async(lounges: list[dict], db, concurrency: int = CONCURR
         "facebook_url":  "facebook_missing",
         "instagram_url": "instagram_missing",
         "tiktok_url":    "tiktok_missing",
+        "youtube_url":   "youtube_missing",
     }
     for lounge in lounges:
         for field, stat_key in _MISSING_KEYS.items():
@@ -1394,15 +1621,30 @@ async def enrich_batch_async(lounges: list[dict], db, concurrency: int = CONCURR
 
     cache: dict = {}
 
-    async with async_playwright() as pw:
-        pool = await PlaywrightPool.create(pw, concurrency)
+    # Reiniciar el browser cada N negocios para liberar memoria acumulada de Chromium
+    BROWSER_RESTART_EVERY = 20
 
-        async def process(lounge):
+    async with async_playwright() as pw:
+        pool_box = [await PlaywrightPool.create(pw, concurrency)]
+
+        async def _run_all():
             nonlocal done
-            print(f"[QUEUE] creando tarea para {lounge.get('name', '?')}")
-            async with semaphore:
+            for i, lounge in enumerate(lounges):
+                # Reinicio periódico — previene crashes por memoria acumulada en Railway/Docker
+                if i > 0 and i % BROWSER_RESTART_EVERY == 0:
+                    logger.info(
+                        f"[PW] Reiniciando browser (negocio {i}/{total}) "
+                        f"— liberando memoria acumulada de {BROWSER_RESTART_EVERY} negocios"
+                    )
+                    try:
+                        await pool_box[0].close()
+                    except Exception as _e:
+                        logger.warning(f"[PW] Error cerrando pool al reiniciar: {_e}")
+                    pool_box[0] = await PlaywrightPool.create(pw, concurrency)
+                    logger.info(f"[PW] Browser reiniciado OK → {lounge.get('name', '?')}")
+
                 try:
-                    await enrich_one(lounge, pool, db, cache)
+                    await enrich_one(lounge, pool_box[0], db, cache)
                 except Exception as exc:
                     logger.warning(f"[QUEUE] enrich_one excepcion para {lounge.get('name')}: {exc}")
                 done += 1
@@ -1415,20 +1657,22 @@ async def enrich_batch_async(lounges: list[dict], db, concurrency: int = CONCURR
                         f"fb:{_stats['facebook_found']} "
                         f"ig:{_stats['instagram_found']} "
                         f"tt:{_stats['tiktok_found']} "
+                        f"yt:{_stats['youtube_found']} "
                         f"searches:{_stats['engine_searches']} "
                         f"avg:{avg:.1f}s",
                         end="\r",
                         flush=True,
                     )
 
-        tasks = [process(l) for l in lounges]
-        print(f"[QUEUE] total tareas creadas: {len(tasks)}")
-        print("[QUEUE] ejecutando asyncio.gather()")
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for i, r in enumerate(results):
-            if isinstance(r, Exception):
-                logger.warning(f"[QUEUE] tarea {i} termino con excepcion: {r}")
-        await pool.close()
+        try:
+            await asyncio.wait_for(_run_all(), timeout=7200)
+        except asyncio.TimeoutError:
+            logger.error("[QUEUE] TIMEOUT GLOBAL: el lote superó 2h — continuando con el siguiente estado")
+
+        try:
+            await pool_box[0].close()
+        except Exception:
+            pass
 
     if not DEBUG:
         print()
@@ -1448,6 +1692,7 @@ def _print_stats(total: int):
     print(f"  Facebook encontrados     : {_stats['facebook_found']}")
     print(f"  Instagram encontrados    : {_stats['instagram_found']}")
     print(f"  TikTok encontrados       : {_stats['tiktok_found']}")
+    print(f"  YouTube encontrados      : {_stats['youtube_found']}")
     print(f"  Consultas Google Maps    : {_stats['maps_queries']}")
     print(f"  Busquedas por motor      : {_stats['engine_searches']}")
     print(f"  Coincidencias descartadas: {_stats['discarded']}")
@@ -1458,6 +1703,7 @@ def _print_stats(total: int):
         ("Facebook ", "facebook_found", "facebook_missing"),
         ("Instagram", "instagram_found", "instagram_missing"),
         ("TikTok   ", "tiktok_found",    "tiktok_missing"),
+        ("YouTube  ", "youtube_found",   "youtube_missing"),
         ("Email    ", "email_found",     "email_missing"),
     ]
     print("\n  Cobertura del enriquecimiento")

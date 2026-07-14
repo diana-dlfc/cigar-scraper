@@ -1,0 +1,6 @@
+[phases.playwright]
+cmds = [
+  "playwright install chromium",
+  "playwright install-deps chromium"
+]
+dependsOn = ["install"]

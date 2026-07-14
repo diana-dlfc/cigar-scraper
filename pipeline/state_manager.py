@@ -10,9 +10,9 @@ from config.states import US_STATES
 # Debe mantenerse en sintonía con enrichment/social_enricher.py (_missing_fields).
 _SOCIAL_COLS = (
     "id,name,city,state,address,website,google_maps_url,"
-    "email,facebook_url,instagram_url,tiktok_url"
+    "email,facebook_url,instagram_url,tiktok_url,youtube_url"
 )
-_SOCIAL_FILTER = "email.is.null,facebook_url.is.null,instagram_url.is.null,tiktok_url.is.null"
+_SOCIAL_FILTER = "email.is.null,facebook_url.is.null,instagram_url.is.null,tiktok_url.is.null,youtube_url.is.null"
 
 _PAGE_SIZE = 1000
 

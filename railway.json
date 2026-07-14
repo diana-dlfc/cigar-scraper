@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python pipeline/orchestrator.py",
+    "startCommand": "python -c \"import os; open('/tmp/credentials.json','w').write(os.environ['GOOGLE_SHEETS_CREDENTIALS_JSON'])\" && python pipeline/orchestrator.py",
     "restartPolicyType": "ON_FAILURE"
   }
 }

@@ -50,6 +50,7 @@ COLUMNS: list[tuple[str, str]] = [
     ("Instagram",       "instagram_url"),
     ("Facebook",        "facebook_url"),
     ("TikTok",          "tiktok_url"),
+    ("YouTube",         "youtube_url"),
     ("Owner",           "owner_name"),
 ]
 
@@ -95,6 +96,7 @@ LINK_KEYS = {
     "instagram_url":   "Instagram",
     "facebook_url":    "Facebook",
     "tiktok_url":      "TikTok",
+    "youtube_url":     "YouTube",
     "website":         "Sitio Web",
 }
 
